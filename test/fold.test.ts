@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import test from "node:test";
 import {
 	buildSummaryLine,
@@ -7,6 +8,7 @@ import {
 	formatDuration,
 	isFinalReply,
 	lastUserIndex,
+	nestedTools,
 	SummaryLine,
 	toolCounts,
 	type FoldableComponent,
@@ -97,7 +99,7 @@ test("hides the process, keeps the reply, parks one summary under the user messa
 	assert.equal(result.record.ordinal, 0);
 });
 
-test("clicking the summary expands the folded rows, clicking again folds them back", () => {
+test("clicking the summary expands the folded rows under a rail, clicking again folds them back", () => {
 	const tool = new Tool("read");
 	const children: FoldableComponent[] = [new User(), tool, reply];
 	const result = fold(children);
@@ -105,7 +107,7 @@ test("clicking the summary expands the folded rows, clicking again folds them ba
 	assert.deepEqual(tool.render(80), []);
 
 	result.summary.handleMouse?.({ type: "click", button: "left" });
-	assert.deepEqual(tool.render(80), ["tool read"]);
+	assert.deepEqual(tool.render(80), ["│ tool read"]);
 	assert.deepEqual(result.summary.render(80), [" ▾ took 42s · 1 call · read×1"]);
 	assert.equal(result.record.expanded, true);
 
@@ -130,6 +132,37 @@ test("a tool group counts as its inner tools", () => {
 	assert.deepEqual(group.render(80), []);
 });
 
+test("nested calls are counted under their host tool", () => {
+	const codemode = new Tool("codemode", false, {
+		details: {
+			calls: [
+				{ name: "bash", status: "ok" },
+				{ name: "bash", status: "ok" },
+				{ name: "bash", status: "error" },
+				{ name: "read", status: "ok" },
+				{ name: "read", status: "ok" },
+			],
+		},
+	});
+	const children: FoldableComponent[] = [new User(), codemode, reply];
+	const result = fold(children);
+	assert.ok(result);
+	assert.deepEqual(result.summary.render(120), [" ▸ took 42s · 1 call · codemode×1 (bash×3 read×2)"]);
+	assert.deepEqual(nestedTools(codemode.result), [["bash", 3], ["read", 2]]);
+	assert.equal(nestedTools(new Tool("bash").result), undefined);
+});
+
+test("a narrow summary drops the nested counts before truncating", () => {
+	const line = buildSummaryLine({
+		expanded: false,
+		ms: 4000,
+		tools: [{ name: "codemode", failed: false, nested: [["bash", 3]] }],
+		fg: plainFg,
+		width: 40,
+	});
+	assert.deepEqual(line, " ▸ took 4s · 1 call · codemode×1");
+});
+
 test("failures are visible on the folded line", () => {
 	const children: FoldableComponent[] = [new User(), new Tool("bash", true), new Tool("bash"), reply];
 	const result = fold(children);
@@ -143,17 +176,17 @@ test("failed and interrupted turns fold too, and say so", () => {
 	const children: FoldableComponent[] = [new User(), tool, errorReply];
 	const result = fold(children, 9000, "error");
 	assert.ok(result);
-	assert.deepEqual(result.summary.render(80), [" ▸ took 9s · 1 call · bash×1 · 1 failed"]);
+	assert.deepEqual(result.summary.render(80), [" ▸ took 9s · 1 call · bash×1 · 1 failed · error"]);
 	assert.deepEqual(tool.render(80), [], "the error row is hidden until expanded");
 	result.summary.handleMouse?.({ type: "click", button: "left" });
-	assert.deepEqual(tool.render(80), ["tool bash"], "expanding shows the failure row again");
+	assert.deepEqual(tool.render(80), ["│ tool bash"], "expanding shows the failure row again");
 	assert.deepEqual(errorReply.render(80), ["assistant"], "the error text stays visible");
 });
 
 test("a restored fold starts expanded with the saved counts and no components to derive them from", () => {
 	const tool = new Tool("bash");
 	const children: FoldableComponent[] = [new User(), tool, reply];
-	const saved: ToolEntry[] = [{ name: "codemode", failed: false }];
+	const saved: ToolEntry[] = [{ name: "codemode", failed: false, nested: [["bash", 1]] }];
 	const result = foldInterval({
 		children,
 		userIndex: 0,
@@ -166,8 +199,8 @@ test("a restored fold starts expanded with the saved counts and no components to
 		fg: plainFg,
 	});
 	assert.ok(result);
-	assert.deepEqual(result.summary.render(120), [" ▾ took 4s · 1 call · codemode×1"]);
-	assert.deepEqual(tool.render(80), ["tool bash"], "restored expanded turn keeps its rows");
+	assert.deepEqual(result.summary.render(120), [" ▾ took 4s · 1 call · codemode×1 (bash×1)"]);
+	assert.deepEqual(tool.render(80), ["│ tool bash"], "restored expanded turn keeps its rows, railed");
 });
 
 test("a turn stops at the next user message: later turns are not swallowed", () => {
@@ -234,6 +267,6 @@ test("summary line formatting", () => {
 		fg: plainFg,
 		width: 12,
 	});
-	assert.ok(long.length > 0);
+	assert.ok(visibleWidth(long) <= 12, `narrow width truncated: ${JSON.stringify(long)}`);
 	assert.equal(buildSummaryLine({ expanded: false, ms: 0, tools: [], fg: plainFg, width: 0 }), "");
 });

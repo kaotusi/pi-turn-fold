@@ -12,7 +12,21 @@ Fold one pi agent turn into a single clickable row.
 
 Click the row to show what it replaced (the tool rows, groups and intermediate
 messages drawn by [pi-cc-extensions](https://github.com/minuque/pi-cc-extensions)),
-click again to fold it back.
+marked with a `│` gutter, click again to fold it back.
+
+Sub-calls a tool reports in its own result (pi's codemode `details.calls`) are
+counted under it: `codemode×1 (bash×3 read×2)`.
+
+Commands:
+
+```
+/fold turn last   toggle the newest folded turn (or /fold turn 3)
+/fold on          fold turns again
+/fold off         unfold everything, stop folding new turns
+```
+
+Folds survive a restart: each one is appended to the session, and a reopened
+session re-applies them after the transcript is rendered.
 
 ## Install
 
@@ -26,7 +40,7 @@ pi -e /path/to/pi-turn-fold/extensions/index.ts
 
 pi has no message-level renderer, so the extension caps
 `InteractiveMode.prototype.addMessageToChat` to capture the live `chatContainer`,
-then on `agent_settled` (completed runs only):
+then on `agent_settled`:
 
 1. finds the turn's `UserMessageComponent` and the final text reply,
 2. hides every component in between (`render()` → `[]`),
@@ -37,16 +51,17 @@ work: pi dispatches mouse events over the component tree, not over rendered text
 Hiding components instead of rebuilding the turn keeps pi-cc-extensions' grouping,
 diff rendering and footers intact when the row is expanded.
 
-Failed and interrupted turns are never folded, so error rows stay visible.
+Failed and interrupted turns fold too; the summary says `1 failed` / `aborted` and
+expanding still shows the error rows verbatim.
 
 ## Status
 
-Stage S1. Not done yet: persistence across restarts (S2), `/fold turn [N|last]` and
-`/fold on|off` commands, an expand-time `│` gutter, live-turn folding (S3).
+Stage S3 done. Not done: folding while a turn is still running (only settled turns
+fold).
 
 ## Dev
 
 ```bash
-npm test        # node --test, 9 checks
+npm test        # node --test, 14 checks
 npm run typecheck
 ```

@@ -21,10 +21,11 @@ export interface MouseEventResult {
 	render?: boolean;
 }
 
-/** One tool call as it appears in a summary. */
+/** One tool call as it appears in a summary; `nested` are the sub-calls it reported itself. */
 export interface ToolEntry {
 	name: string;
 	failed: boolean;
+	nested?: Array<[string, number]>;
 }
 
 export type Fg = (color: string, text: string) => string;
@@ -45,6 +46,29 @@ export function showComponent(component: FoldableComponent | undefined): void {
 	if (!original) return;
 	component.render = original;
 	originalRenders.delete(component);
+	component.invalidate?.();
+}
+
+const originalRailRenders = new WeakMap<FoldableComponent, (width: number) => readonly string[]>();
+
+/**
+ * Mark an expanded component as part of a turn: `│ ` in front. The child keeps the full width —
+ * narrowing it makes cc-extensions truncate its own styled rows and cut an ANSI sequence apart.
+ */
+export function railComponent(component: FoldableComponent | undefined): void {
+	if (!component || typeof component.render !== "function" || originalRailRenders.has(component) || originalRenders.has(component)) return;
+	const original = component.render;
+	originalRailRenders.set(component, original);
+	component.render = (width: number) => original.call(component, width).map((row) => (row.trim() === "" ? row : `│ ${row}`));
+	component.invalidate?.();
+}
+
+export function unrailComponent(component: FoldableComponent | undefined): void {
+	if (!component) return;
+	const original = originalRailRenders.get(component);
+	if (!original) return;
+	component.render = original;
+	originalRailRenders.delete(component);
 	component.invalidate?.();
 }
 
@@ -80,6 +104,30 @@ export function toolCounts(tools: readonly ToolEntry[]): Array<[string, number]>
 	return [...counts];
 }
 
+/** Sub-call counts per tool name, merged across repeats. */
+export function nestedCounts(tools: readonly ToolEntry[]): Map<string, Array<[string, number]>> {
+	const nested = new Map<string, Map<string, number>>();
+	for (const tool of tools) {
+		if (!tool.nested?.length) continue;
+		const slot = nested.get(tool.name) ?? new Map<string, number>();
+		for (const [name, count] of tool.nested) slot.set(name, (slot.get(name) ?? 0) + count);
+		nested.set(tool.name, slot);
+	}
+	return new Map([...nested].map(([name, slot]) => [name, [...slot]]));
+}
+
+/** Sub-calls a tool reported in its own result (`details.calls`, the shape pi's codemode writes). */
+export function nestedTools(result: unknown): Array<[string, number]> | undefined {
+	const calls = (result as { details?: { calls?: unknown } } | undefined)?.details?.calls;
+	if (!Array.isArray(calls)) return undefined;
+	const counts = new Map<string, number>();
+	for (const call of calls) {
+		const name = String((call as { name?: unknown })?.name ?? "tool");
+		counts.set(name, (counts.get(name) ?? 0) + 1);
+	}
+	return counts.size > 0 ? [...counts] : undefined;
+}
+
 export interface SummaryLineInput {
 	expanded: boolean;
 	ms?: number;
@@ -89,17 +137,30 @@ export interface SummaryLineInput {
 	width: number;
 }
 
-/** ` ▸ took 42s · 9 calls · read×4 · bash×3` — one muted row, cc-style separators. */
-export function buildSummaryLine({ expanded, ms, tools, outcome: _outcome, fg, width }: SummaryLineInput): string {
-	if (!(width > 0)) return "";
+function summaryParts(expanded: boolean, ms: number | undefined, outcome: string | undefined, tools: readonly ToolEntry[], fg: Fg, withNested: boolean): string[] {
+	const nested = withNested ? nestedCounts(tools) : new Map<string, Array<[string, number]>>();
 	const parts = [
 		fg("muted", `${expanded ? "▾" : "▸"} took ${formatDuration(ms)}`),
 		fg("muted", `${tools.length} ${tools.length === 1 ? "call" : "calls"}`),
 	];
-	for (const [name, count] of toolCounts(tools)) parts.push(fg("muted", `${name}×${count}`));
+	for (const [name, count] of toolCounts(tools)) {
+		const inner = nested.get(name);
+		const detail = inner ? ` (${inner.map(([nestedName, nestedCount]) => `${nestedName}×${nestedCount}`).join(" ")})` : "";
+		parts.push(fg("muted", `${name}×${count}${detail}`));
+	}
 	const failed = tools.filter((tool) => tool.failed).length;
 	if (failed > 0) parts.push(fg("error", `${failed} failed`));
-	return truncateToWidth(` ${parts.join(fg("muted", " · "))}`, width, "…");
+	if (outcome === "error" || outcome === "aborted") parts.push(fg("error", outcome));
+	return parts;
+}
+
+/** ` ▸ took 42s · 9 calls · codemode×1 (bash×3 read×2)` — one muted row, cc-style separators. */
+export function buildSummaryLine({ expanded, ms, tools, outcome, fg, width }: SummaryLineInput): string {
+	if (!(width > 0)) return "";
+	const separator = fg("muted", " · ");
+	const full = ` ${summaryParts(expanded, ms, outcome, tools, fg, true).join(separator)}`;
+	if (visibleWidth(full) <= width) return full;
+	return truncateToWidth(` ${summaryParts(expanded, ms, outcome, tools, fg, false).join(separator)}`, width, "…");
 }
 
 /** What a folded turn persists, so a reopened session can restore the fold. */
@@ -181,6 +242,7 @@ export function foldInterval({ children, userIndex, ToolClass, AssistantClass, U
 		: interval.flatMap((component) => toolsOf(component, ToolClass)).map((tool) => ({
 				name: String(tool.toolName ?? "tool"),
 				failed: Boolean((tool.result as { isError?: boolean } | undefined)?.isError),
+				nested: nestedTools(tool.result),
 			}));
 	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass });
 }
@@ -208,13 +270,19 @@ function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded,
 	const summary = new SummaryLine({ ...record, fg }, (next) => {
 		record.expanded = next;
 		for (const component of hidden) {
-			if (next) showComponent(component);
-			else hideComponent(component);
+			if (next) {
+				showComponent(component);
+				railComponent(component);
+			} else {
+				unrailComponent(component);
+				hideComponent(component);
+			}
 		}
 		onToggle?.(next);
 	});
 	for (const component of hidden) {
-		if (!expanded) hideComponent(component);
+		if (expanded) railComponent(component);
+		else hideComponent(component);
 	}
 	children.splice(userIndex + 1, 0, new Spacer(1), summary, new Spacer(1));
 	return { summary, hidden, record };

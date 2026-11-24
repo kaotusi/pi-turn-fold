@@ -194,9 +194,34 @@ function restore(pi: ExtensionAPI, branch: readonly unknown[] | undefined): void
 	state.ui?.requestRender?.();
 }
 
+function runCommand(pi: ExtensionAPI, args: string): void {
+	const words = args.trim().split(/\s+/).filter(Boolean);
+	const target = words[0] === "turn" ? words[1] : words[0];
+	if (target === "on" || target === "off") {
+		state.foldsEnabled = target === "on";
+		pi.appendEntry(OPTIONS_ENTRY, { folds: state.foldsEnabled });
+		for (const fold of state.folds.values()) fold.summary.setExpanded(!state.foldsEnabled);
+		return;
+	}
+	const folds = [...state.folds.values()].sort((left, right) => left.record.ordinal - right.record.ordinal);
+	const fold = target === undefined || target === "last" ? folds.at(-1) : folds[Number(target) - 1];
+	fold?.summary.setExpanded(!fold.summary.expanded);
+}
+
 export default function piTurnFold(pi: ExtensionAPI): void {
 	if (!installChatHook()) return;
 	installRenderHook(pi);
+
+	pi.registerCommand("fold", {
+		description: "Fold turn transcripts: /fold turn [N|last], /fold on|off",
+		handler: async (args) => {
+			try {
+				runCommand(pi, args);
+			} catch (error) {
+				warn("command failed", error);
+			}
+		},
+	});
 
 	const reload = (ctx: { ui?: unknown }): void => {
 		// SAFETY: ctx.ui is pi's extension UI; only theme.fg and requestRender are read, both guarded below.
