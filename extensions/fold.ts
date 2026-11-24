@@ -1,5 +1,4 @@
-import { Spacer } from "@earendil-works/pi-tui";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { Spacer, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /** Minimal component shape shared by pi-tui components and the fakes in tests. */
 export interface FoldableComponent {
@@ -22,6 +21,7 @@ export interface MouseEventResult {
 	render?: boolean;
 }
 
+/** One tool call as it appears in a summary. */
 export interface ToolEntry {
 	name: string;
 	failed: boolean;
@@ -73,11 +73,6 @@ export function formatDuration(ms: number | undefined): string {
 	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-/** Failed and interrupted turns stay verbatim: error rows must never disappear. */
-export function shouldFoldTurn(aborted: boolean, outcome: string | undefined): boolean {
-	return !aborted && (!outcome || outcome === "completed");
-}
-
 /** Tool calls by name, in order of first appearance. */
 export function toolCounts(tools: readonly ToolEntry[]): Array<[string, number]> {
 	const counts = new Map<string, number>();
@@ -89,12 +84,13 @@ export interface SummaryLineInput {
 	expanded: boolean;
 	ms?: number;
 	tools: readonly ToolEntry[];
+	outcome?: string;
 	fg: Fg;
 	width: number;
 }
 
 /** ` ▸ took 42s · 9 calls · read×4 · bash×3` — one muted row, cc-style separators. */
-export function buildSummaryLine({ expanded, ms, tools, fg, width }: SummaryLineInput): string {
+export function buildSummaryLine({ expanded, ms, tools, outcome: _outcome, fg, width }: SummaryLineInput): string {
 	if (!(width > 0)) return "";
 	const parts = [
 		fg("muted", `${expanded ? "▾" : "▸"} took ${formatDuration(ms)}`),
@@ -106,30 +102,25 @@ export function buildSummaryLine({ expanded, ms, tools, fg, width }: SummaryLine
 	return truncateToWidth(` ${parts.join(fg("muted", " · "))}`, width, "…");
 }
 
-export interface FoldTurnInput {
-	children: FoldableComponent[];
-	ToolClass: new (...args: never[]) => unknown;
-	AssistantClass: new (...args: never[]) => unknown;
-	UserClass: new (...args: never[]) => unknown;
+/** What a folded turn persists, so a reopened session can restore the fold. */
+export interface FoldRecord {
+	ordinal: number;
 	ms?: number;
-	fg: Fg;
-	onToggle?: (expanded: boolean) => void;
-}
-
-export interface FoldTurnResult {
-	summary: SummaryLine;
-	hidden: FoldableComponent[];
+	outcome?: string;
+	tools: ToolEntry[];
+	expanded: boolean;
 }
 
 /** One clickable row standing in for a folded turn. */
 export class SummaryLine implements FoldableComponent {
 	expanded = false;
-	private options: Omit<SummaryLineInput, "expanded" | "width">;
+	private readonly options: Omit<SummaryLineInput, "width">;
 	private readonly onToggle?: (expanded: boolean) => void;
 	private cache?: { width: number; line: string };
 
-	constructor(options: Omit<SummaryLineInput, "expanded" | "width">, onToggle?: (expanded: boolean) => void) {
+	constructor(options: Omit<SummaryLineInput, "width">, onToggle?: (expanded: boolean) => void) {
 		this.options = options;
+		this.expanded = options.expanded;
 		this.onToggle = onToggle;
 	}
 
@@ -158,46 +149,86 @@ export class SummaryLine implements FoldableComponent {
 	}
 }
 
-/**
- * Fold the last turn in place: hide everything between its user message and its reply
- * (tool rows, groups, intermediate messages, spacers), then park a summary row right
- * below the user message. Returns undefined when there is nothing worth folding.
- */
-export function foldTurn({ children, ToolClass, AssistantClass, UserClass, ms, fg, onToggle }: FoldTurnInput): FoldTurnResult | undefined {
-	let userIndex = -1;
-	for (let index = children.length - 1; index >= 0; index--) {
-		if (children[index] instanceof UserClass) {
-			userIndex = index;
-			break;
-		}
-	}
-	if (userIndex < 0) return undefined;
+export interface FoldInput {
+	children: FoldableComponent[];
+	userIndex: number;
+	ToolClass: new (...args: never[]) => unknown;
+	AssistantClass: new (...args: never[]) => unknown;
+	UserClass: new (...args: never[]) => unknown;
+	ms?: number;
+	outcome?: string;
+	/** Saved calls (restore path); derived from the components when absent. */
+	tools?: readonly ToolEntry[];
+	expanded?: boolean;
+	fg: Fg;
+	onToggle?: (expanded: boolean) => void;
+}
 
-	const interval = children.slice(userIndex + 1);
-	const tools = interval.flatMap((component) => toolsOf(component, ToolClass));
+export interface FoldResult {
+	summary: SummaryLine;
+	hidden: FoldableComponent[];
+	record: FoldRecord;
+}
+
+/** Hide everything between one user message and its reply, leaving a summary row below the user message. */
+export function foldInterval({ children, userIndex, ToolClass, AssistantClass, UserClass, ms, outcome, tools, expanded = false, fg, onToggle }: FoldInput): FoldResult | undefined {
+	if (userIndex < 0 || userIndex >= children.length) return undefined;
+	// a turn ends at the next user message: later turns are their own folds
+	const next = children.findIndex((component, index) => index > userIndex && component instanceof UserClass);
+	const interval = children.slice(userIndex + 1, next < 0 ? children.length : next);
+	const entries: ToolEntry[] = tools
+		? [...tools]
+		: interval.flatMap((component) => toolsOf(component, ToolClass)).map((tool) => ({
+				name: String(tool.toolName ?? "tool"),
+				failed: Boolean((tool.result as { isError?: boolean } | undefined)?.isError),
+			}));
+	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass });
+}
+
+interface FoldWithInput {
+	children: FoldableComponent[];
+	userIndex: number;
+	interval: FoldableComponent[];
+	tools: readonly ToolEntry[];
+	ms?: number;
+	outcome?: string;
+	expanded: boolean;
+	fg: Fg;
+	onToggle?: (expanded: boolean) => void;
+	AssistantClass: new (...args: never[]) => unknown;
+	UserClass: new (...args: never[]) => unknown;
+}
+
+function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass }: FoldWithInput): FoldResult | undefined {
 	if (tools.length === 0) return undefined;
-
 	const reply = [...interval].reverse().find((component) => isFinalReply(component, AssistantClass));
 	const hidden = interval.filter((component) => component !== reply);
-
-	const summary = new SummaryLine(
-		{
-			ms,
-			tools: tools.map((tool) => ({
-				name: String(tool.toolName ?? "tool"),
-				failed: Boolean((tool.result as { isError?: boolean } | undefined)?.isError),			})),
-			fg,
-		},
-		(expanded) => {
-			for (const component of hidden) {
-				if (expanded) showComponent(component);
-				else hideComponent(component);
-			}
-			onToggle?.(expanded);
-		},
-	);
-
-	for (const component of hidden) hideComponent(component);
+	const ordinal = children.slice(0, userIndex + 1).filter((component) => component instanceof UserClass).length - 1;
+	const record: FoldRecord = { ordinal, ms, outcome, tools: [...tools], expanded };
+	const summary = new SummaryLine({ ...record, fg }, (next) => {
+		record.expanded = next;
+		for (const component of hidden) {
+			if (next) showComponent(component);
+			else hideComponent(component);
+		}
+		onToggle?.(next);
+	});
+	for (const component of hidden) {
+		if (!expanded) hideComponent(component);
+	}
 	children.splice(userIndex + 1, 0, new Spacer(1), summary, new Spacer(1));
-	return { summary, hidden };
+	return { summary, hidden, record };
+}
+
+/** Index of the newest user message, or -1. */
+export function lastUserIndex(children: readonly FoldableComponent[], UserClass: new (...args: never[]) => unknown): number {
+	for (let index = children.length - 1; index >= 0; index--) {
+		if (children[index] instanceof UserClass) return index;
+	}
+	return -1;
+}
+
+/** Fold the last turn in place. Returns undefined when it holds no tool call. */
+export function foldTurn(input: Omit<FoldInput, "userIndex" | "tools" | "expanded">): FoldResult | undefined {
+	return foldInterval({ ...input, userIndex: lastUserIndex(input.children, input.UserClass) });
 }
