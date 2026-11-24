@@ -12,6 +12,7 @@ import {
 	nestedFailures,
 	nestedTools,
 	SummaryLine,
+	isThinkingBlock,
 	toolCounts,
 	type FoldableComponent,
 	type ToolEntry,
@@ -332,4 +333,12 @@ test("summary line formatting", () => {
 	});
 	assert.ok(visibleWidth(long) <= 12, `narrow width truncated: ${JSON.stringify(long)}`);
 	assert.equal(buildSummaryLine({ expanded: false, ms: 0, tools: [], fg: plainFg, width: 0 }), "");
+});
+
+test("a thinking block is told apart from the answer and from other rows", () => {
+	const thinking = { setExpanded: () => {}, messageTimestamp: 1, runStartIndex: 0, render: () => ["x"] };
+	assert.equal(isThinkingBlock(thinking as unknown as FoldableComponent), true);
+	assert.equal(isThinkingBlock(new Tool("bash")), false);
+	assert.equal(isThinkingBlock({ setExpanded: () => {}, messageTimestamp: 1 } as unknown as FoldableComponent), false);
+	assert.equal(isThinkingBlock(undefined), false);
 });

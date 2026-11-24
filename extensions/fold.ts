@@ -101,6 +101,16 @@ export function hasToolCall(component: FoldableComponent | undefined): boolean {
 	return Array.isArray(message?.content) && message.content.some((block) => block?.type === "toolCall");
 }
 
+/** cc's compact thinking box: the only child that carries a collapsed preview of thinking text. */
+export function isThinkingBlock(component: FoldableComponent | undefined): boolean {
+	const block = component as { setExpanded?: unknown; messageTimestamp?: unknown; runStartIndex?: unknown } | undefined;
+	return (
+		typeof block?.setExpanded === "function" &&
+		typeof block.messageTimestamp === "number" &&
+		typeof block.runStartIndex === "number"
+	);
+}
+
 /** The turn's answer: an assistant message with visible text and no pending tool call. */
 export function isFinalReply(component: FoldableComponent | undefined, AssistantClass: new (...args: never[]) => unknown): boolean {
 	if (!component || !(component instanceof AssistantClass)) return false;

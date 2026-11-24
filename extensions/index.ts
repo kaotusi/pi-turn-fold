@@ -8,6 +8,7 @@ import {
 	foldInterval,
 	hideComponent,
 	isFinalReply,
+	isThinkingBlock,
 	lastUserIndex,
 	nestedFailures,
 	nestedTools,
@@ -26,6 +27,7 @@ const HOOK = Symbol.for("pi-turn-fold.chat-hook");
 const HOOK_RENDER = Symbol.for("pi-turn-fold.render-hook");
 const HOOK_ADD_CHILD = Symbol.for("pi-turn-fold.add-child-hook");
 const HOOK_PAINT = Symbol.for("pi-turn-fold.paint-hook");
+const HOOK_THINKING = Symbol.for("pi-turn-fold.thinking-filter");
 const TURN_ENTRY = "pi-turn-fold.turn";
 const OPTIONS_ENTRY = "pi-turn-fold.options";
 
@@ -129,6 +131,9 @@ type RenderSessionItems = ((this: ChatHost, items: unknown, meta?: unknown, opti
 
 type AddChildHook = ((this: Container, child: unknown) => void) & { [HOOK_ADD_CHILD]?: boolean };
 
+/** addChild after hideThinking marked it, so the answer's container is not wrapped twice. */
+type HookedAddChild = AddChildHook & { [HOOK_THINKING]?: boolean };
+
 type PaintHook = ((this: Container, width: number) => readonly string[]) & { [HOOK_PAINT]?: boolean };
 
 /**
@@ -215,6 +220,30 @@ function attachChat(chat: Container): void {
 		};
 		wrapped[HOOK_PAINT] = true;
 		holder.render = wrapped;
+	}
+}
+
+/**
+ * cc keeps thinking text in its own collapsible box inside the answer component. Hide it there:
+ * hooking the box container drops it now and again whenever cc rebuilds the message.
+ */
+function hideThinking(component: FoldableComponent): void {
+	const container = (component as { contentContainer?: Container }).contentContainer;
+	if (!container) return;
+	// SAFETY: a chat component is a Container whose children array and addChild method are the only members read.
+	const holder = container as unknown as { addChild?: HookedAddChild; children?: unknown[] };
+	const addChild = holder.addChild;
+	if (typeof addChild === "function" && !addChild[HOOK_THINKING]) {
+		const wrapped: HookedAddChild = function (this: Container, child) {
+			if (!isThinkingBlock(child as FoldableComponent)) addChild.call(this, child);
+		};
+		wrapped[HOOK_THINKING] = true;
+		holder.addChild = wrapped;
+	}
+	const children = holder.children;
+	if (Array.isArray(children)) {
+		const kept = children.filter((child) => !isThinkingBlock(child as FoldableComponent));
+		if (kept.length !== children.length) children.splice(0, children.length, ...kept);
 	}
 }
 
@@ -437,6 +466,7 @@ function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): 
 	if (reply) {
 		live.reply = reply;
 		live.hidden.delete(reply);
+		hideThinking(reply);
 	}
 	if (live.record.tools.length === 0) {
 		releaseLive(live);
