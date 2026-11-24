@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Spacer } from "@earendil-works/pi-tui";
@@ -5,11 +6,12 @@ import type { Container } from "@earendil-works/pi-tui";
 import {
 	applyHidden,
 	foldInterval,
-	hasToolCall,
+	hideComponent,
 	isFinalReply,
 	lastUserIndex,
 	nestedFailures,
 	nestedTools,
+	railComponent,
 	showComponent,
 	SummaryLine,
 	unrailComponent,
@@ -22,6 +24,8 @@ import {
 
 const HOOK = Symbol.for("pi-turn-fold.chat-hook");
 const HOOK_RENDER = Symbol.for("pi-turn-fold.render-hook");
+const HOOK_ADD_CHILD = Symbol.for("pi-turn-fold.add-child-hook");
+const HOOK_PAINT = Symbol.for("pi-turn-fold.paint-hook");
 const TURN_ENTRY = "pi-turn-fold.turn";
 const OPTIONS_ENTRY = "pi-turn-fold.options";
 
@@ -63,6 +67,31 @@ interface FoldState {
 
 const state: FoldState = { foldsEnabled: true, folds: new Map() };
 
+const DEBUG_LOG = process.env.PI_TURN_FOLD_DEBUG;
+
+/** `PI_TURN_FOLD_DEBUG=1` (or a path) traces components, rows and splices; the detail thunk stays unsampled otherwise. */
+function debug(event: string, detail?: () => Record<string, unknown>): void {
+	if (!DEBUG_LOG) return;
+	try {
+		appendFileSync(DEBUG_LOG === "1" ? "/tmp/pi-turn-fold-debug.log" : DEBUG_LOG, `${Date.now()} ${event}${detail ? ` ${JSON.stringify(detail())}` : ""}\n`);
+	} catch {
+		// tracing must never break the run
+	}
+}
+
+function nameOf(component: FoldableComponent | undefined): string {
+	// SAFETY: every FoldableComponent is an object; the constructor name is only read for tracing.
+	return (component as { constructor?: { name?: string } } | undefined)?.constructor?.name ?? String(component);
+}
+
+function rowsOf(component: FoldableComponent | undefined): number {
+	try {
+		return component?.render(120).length ?? 0;
+	} catch {
+		return -1;
+	}
+}
+
 function warn(message: string, error?: unknown): void {
 	console.warn(`[pi-turn-fold] ${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ""}`);
 }
@@ -98,6 +127,97 @@ type RenderSessionItems = ((this: ChatHost, items: unknown, meta?: unknown, opti
 	[HOOK_RENDER]?: boolean;
 };
 
+type AddChildHook = ((this: Container, child: unknown) => void) & { [HOOK_ADD_CHILD]?: boolean };
+
+type PaintHook = ((this: Container, width: number) => readonly string[]) & { [HOOK_PAINT]?: boolean };
+
+/**
+ * The live row is spliced right under this turn's user message, before any process row exists, so the
+ * first frame already reads as one folded turn.
+ */
+function insertSummary(live: Live, children: FoldableComponent[]): boolean {
+	if (live.inserted || live.userIndex < 0) return false;
+	children.splice(live.userIndex + 1, 0, new Spacer(1), live.summary, new Spacer(1));
+	live.inserted = true;
+	state.folds.set(live.record.ordinal, { summary: live.summary, record: live.record });
+	debug("summary-inserted", () => ({ ordinal: live.record.ordinal, userIndex: live.userIndex }));
+	return true;
+}
+
+/**
+ * pi attaches the turn's user message and then starts the run, so the row can be placed at
+ * before_agent_start. Anything else as the last child means the message is still on its way and the
+ * addChild hook places the row instead.
+ */
+function attachSummary(live: Live): void {
+	const children = state.chat?.children as FoldableComponent[] | undefined;
+	if (!Array.isArray(children)) return;
+	if (live.userIndex < 0) {
+		const last = children[children.length - 1];
+		if (!(last instanceof UserMessageComponent)) return;
+		live.userIndex = children.length - 1;
+		live.ordinal = children.filter((component) => component instanceof UserMessageComponent).length - 1;
+		live.record.ordinal = live.ordinal;
+	}
+	if (insertSummary(live, children)) rerender();
+}
+
+/**
+ * pi and cc both append process components straight to the chat container; wrapping addChild folds them
+ * in the same call that attaches them, so nothing of the run is ever painted.
+ */
+function attachChat(chat: Container): void {
+	state.chat = chat;
+	// SAFETY: chat is a pi-tui Container; its instance hooks are only read and rewritten member by member.
+	const holder = chat as unknown as { addChild?: AddChildHook; render?: PaintHook };
+	const addChild = holder.addChild;
+	if (typeof addChild === "function" && !addChild[HOOK_ADD_CHILD]) {
+		const wrapped: AddChildHook = function (this: Container, child) {
+			const component = child as FoldableComponent | undefined;
+			const live = state.live;
+			if (live && component) {
+				if (component instanceof UserMessageComponent && live.userIndex < 0) {
+					addChild.call(this, child);
+					const children = this.children as FoldableComponent[];
+					const index = children.indexOf(component);
+					if (index >= 0) {
+						live.userIndex = index;
+						live.ordinal = children.slice(0, index + 1).filter((item) => item instanceof UserMessageComponent).length - 1;
+						live.record.ordinal = live.ordinal;
+						if (insertSummary(live, children)) rerender();
+					}
+					return;
+				}
+				if (isProcess(component, live)) {
+					if (live.expanded) railComponent(component);
+					else hideComponent(component);
+					live.hidden.add(component);
+					debug("add-child-hidden", () => ({ name: nameOf(component), rows: rowsOf(component) }));
+				}
+			}
+			addChild.call(this, child);
+		};
+		wrapped[HOOK_ADD_CHILD] = true;
+		holder.addChild = wrapped;
+	}
+	const render = holder.render;
+	if (typeof render === "function" && !render[HOOK_PAINT]) {
+		const wrapped: PaintHook = function (this: Container, width) {
+			// last line of defence: a component that slipped past addChild is folded before it is painted
+			if (state.live) {
+				try {
+					sweep(state.live);
+				} catch (error) {
+					warn("could not fold before paint", error);
+				}
+			}
+			return render.call(this, width);
+		};
+		wrapped[HOOK_PAINT] = true;
+		holder.render = wrapped;
+	}
+}
+
 function installChatHook(): boolean {
 	// SAFETY: the class is a real constructor; only its prototype surface is read, member by member.
 	const proto = (InteractiveMode as unknown as { prototype?: Record<string, unknown> })?.prototype;
@@ -109,8 +229,16 @@ function installChatHook(): boolean {
 	if (!proto) return false;
 	if (original[HOOK]) return true;
 	const wrapped: AddMessageToChat = function (this: { chatContainer?: Container }, message, options) {
-		if (this?.chatContainer) state.chat = this.chatContainer;
+		if (this?.chatContainer) attachChat(this.chatContainer);
+		const before = this?.chatContainer?.children.length;
 		original.call(this, message, options);
+		const children = this?.chatContainer?.children;
+		debug("add-message", () => ({
+			role: (message as { role?: string } | undefined)?.role,
+			before,
+			after: children?.length,
+			added: before === undefined || !children ? undefined : nameOf(children[children.length - 1] as FoldableComponent),
+		}));
 		if (state.live) {
 			try {
 				sweep(state.live);
@@ -160,18 +288,22 @@ function persist(pi: ExtensionAPI, record: FoldRecord): void {
 }
 
 /**
- * Repaint outside the current frame: a request made while pi is composing a frame is swallowed and
- * the screen keeps the older layout (rows spliced in by a fold never show up).
+ * Repaint in the same tick: pi builds its frame from process.nextTick, so a request made now lands in
+ * that frame (a setTimeout(0) lands after it and leaves one frame showing the unfolded turn).
  */
 function rerender(): void {
-	setTimeout(() => {
+	const paint = (): void => {
 		try {
 			state.chat?.invalidate?.();
 			state.ui?.requestRender?.(true);
 		} catch (error) {
 			warn("could not repaint", error);
 		}
-	}, 0);
+	};
+	debug("rerender");
+	paint();
+	// one fallback for the window where pi is already composing and drops the first request
+	queueMicrotask(paint);
 }
 
 /** Start the live row: everything the run adds to the chat goes behind it until it settles. */
@@ -226,6 +358,7 @@ function beginLive(pi: ExtensionAPI): void {
 		rerender();
 	}, 500);
 	live.timer.unref?.();
+	attachSummary(live);
 }
 
 /** The chat children, with this run's user message located on first use. */
@@ -242,15 +375,13 @@ function resolveLive(live: Live): FoldableComponent[] | undefined {
 	return children;
 }
 
-/** Process, not answer: tool rows, cc's tool groups, tool-carrying assistant messages and mid-run notices. */
+/** Process, not answer: tool rows, cc's tool groups, and every message the run streams before it settles. */
 function isProcess(component: FoldableComponent, live: Live): boolean {
 	if (component === live.reply) return false;
 	if (component instanceof ToolExecutionComponent) return true;
 	if (typeof (component as { toolName?: unknown }).toolName === "string") return true;
-	if (component instanceof AssistantMessageComponent) {
-		// before the first tool call an answer still streams plainly: there is no row to hide it behind
-		return live.calls.size > 0 || hasToolCall(component);
-	}
+	// thinking and tool-calling text arrive in the same component the answer does: hidden until settle
+	if (component instanceof AssistantMessageComponent) return true;
 	// sub-agent notices and other custom rows: part of the run once it is doing tools
 	return live.calls.size > 0;
 }
@@ -265,13 +396,14 @@ function sweep(live: Live): void {
 		if (component instanceof UserMessageComponent) break;
 		if (isProcess(component, live)) live.hidden.add(component);
 	}
-	if (live.hidden.size === 0) return;
-	if (!live.inserted) {
-		children.splice(live.userIndex + 1, 0, new Spacer(1), live.summary, new Spacer(1));
-		live.inserted = true;
-		state.folds.set(live.record.ordinal, { summary: live.summary, record: live.record });
-	}
-	applyHidden(live.hidden, live.expanded);
+	insertSummary(live, children);
+	if (live.hidden.size > 0) applyHidden(live.hidden, live.expanded);
+	debug("sweep", () => ({
+		children: children.length,
+		hidden: live.hidden.size,
+		inserted: live.inserted,
+		visible: children.filter((component) => rowsOf(component) > 0).map((component) => nameOf(component)),
+	}));
 }
 
 /** Undo a live row completely: the process comes back, the row goes away. */
@@ -460,8 +592,10 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 		if (!state.live) beginLive(pi);
 	});
 
-	pi.on("before_agent_start", () => {
-		if (state.foldsEnabled) beginLive(pi);
+	pi.on("before_agent_start", (_event, ctx) => {
+		rememberUi(ctx.ui as Ui);
+		// agent_start may have opened the row already; a second one would drop what it hid
+		if (state.foldsEnabled && !state.live) beginLive(pi);
 	});
 
 	pi.on("tool_execution_start", (event) => {
@@ -470,6 +604,7 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 		if (!live || event.parentToolCallId) return;
 		live.calls.set(event.toolCallId, { name: event.toolName, failed: false });
 		live.summary.invalidate();
+		debug("tool-start", () => ({ tool: event.toolName, hidden: live.hidden.size, inserted: live.inserted }));
 		sweep(live);
 	});
 
