@@ -26,6 +26,7 @@ export interface ToolEntry {
 	name: string;
 	failed: boolean;
 	nested?: Array<[string, number]>;
+	nestedFailed?: number;
 }
 
 export type Fg = (color: string, text: string) => string;
@@ -128,6 +129,16 @@ export function nestedTools(result: unknown): Array<[string, number]> | undefine
 	return counts.size > 0 ? [...counts] : undefined;
 }
 
+/** Sub-calls that reported a failure inside a tool's own result (`details.calls[].status === "error"`). */
+export function nestedFailures(result: unknown): number {
+	const calls = (result as { details?: { calls?: unknown } } | undefined)?.details?.calls;
+	if (!Array.isArray(calls)) return 0;
+	return calls.filter((call) => {
+		const status = (call as { status?: unknown })?.status;
+		return status === "error" || Boolean((call as { error?: unknown })?.error);
+	}).length;
+}
+
 export interface SummaryLineInput {
 	expanded: boolean;
 	ms?: number;
@@ -150,6 +161,8 @@ function summaryParts(expanded: boolean, ms: number | undefined, outcome: string
 	}
 	const failed = tools.filter((tool) => tool.failed).length;
 	if (failed > 0) parts.push(fg("error", `${failed} failed`));
+	const nestedFailed = tools.reduce((sum, tool) => sum + (tool.nestedFailed ?? 0), 0);
+	if (nestedFailed > 0) parts.push(fg("error", `${nestedFailed} nested failed`));
 	if (outcome === "error" || outcome === "aborted") parts.push(fg("error", outcome));
 	return parts;
 }
@@ -197,7 +210,9 @@ export class SummaryLine implements FoldableComponent {
 	}
 
 	render(width: number): string[] {
-		if (this.cache?.width === width) return [this.cache.line];
+		if (this.cache?.width === width) {
+			return [this.cache.line];
+		}
 		const line = buildSummaryLine({ ...this.options, expanded: this.expanded, width });
 		this.cache = { width, line };
 		return [line];
@@ -243,6 +258,7 @@ export function foldInterval({ children, userIndex, ToolClass, AssistantClass, U
 				name: String(tool.toolName ?? "tool"),
 				failed: Boolean((tool.result as { isError?: boolean } | undefined)?.isError),
 				nested: nestedTools(tool.result),
+				nestedFailed: nestedFailures(tool.result) || undefined,
 			}));
 	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass });
 }
@@ -300,3 +316,4 @@ export function lastUserIndex(children: readonly FoldableComponent[], UserClass:
 export function foldTurn(input: Omit<FoldInput, "userIndex" | "tools" | "expanded">): FoldResult | undefined {
 	return foldInterval({ ...input, userIndex: lastUserIndex(input.children, input.UserClass) });
 }
+

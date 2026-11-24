@@ -51,17 +51,25 @@ work: pi dispatches mouse events over the component tree, not over rendered text
 Hiding components instead of rebuilding the turn keeps pi-cc-extensions' grouping,
 diff rendering and footers intact when the row is expanded.
 
-Failed and interrupted turns fold too; the summary says `1 failed` / `aborted` and
-expanding still shows the error rows verbatim.
+Failed and interrupted turns fold too; the summary says `1 failed` for a tool that
+errored and `1 nested failed` for a sub-call that failed inside a tool's own result,
+and expanding still shows the error rows verbatim.
 
 ## Status
 
 Stage S3 done. Not done: folding while a turn is still running (only settled turns
 fold).
 
+Known edges:
+
+- A reopened turn always comes back collapsed; an expanded restore paints a stale
+  first frame, so the expanded state is not restored.
+- Click coordinates must be read off the screen right before clicking: expanding a
+  turn above the row you want shifts it.
+
 ## Dev
 
 ```bash
-npm test        # node --test, 14 checks
+npm test        # node --test, 15 checks
 npm run typecheck
 ```

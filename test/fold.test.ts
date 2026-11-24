@@ -8,6 +8,7 @@ import {
 	formatDuration,
 	isFinalReply,
 	lastUserIndex,
+	nestedFailures,
 	nestedTools,
 	SummaryLine,
 	toolCounts,
@@ -147,9 +148,11 @@ test("nested calls are counted under their host tool", () => {
 	const children: FoldableComponent[] = [new User(), codemode, reply];
 	const result = fold(children);
 	assert.ok(result);
-	assert.deepEqual(result.summary.render(120), [" ▸ took 42s · 1 call · codemode×1 (bash×3 read×2)"]);
+	assert.deepEqual(result.summary.render(120), [" ▸ took 42s · 1 call · codemode×1 (bash×3 read×2) · 1 nested failed"]);
 	assert.deepEqual(nestedTools(codemode.result), [["bash", 3], ["read", 2]]);
 	assert.equal(nestedTools(new Tool("bash").result), undefined);
+	assert.equal(nestedFailures(codemode.result), 1, "only the failed sub-call counts");
+	assert.equal(nestedFailures(new Tool("bash").result), 0, "a tool without sub-calls never reports nested failures");
 });
 
 test("a narrow summary drops the nested counts before truncating", () => {
@@ -168,6 +171,20 @@ test("failures are visible on the folded line", () => {
 	const result = fold(children);
 	assert.ok(result);
 	assert.deepEqual(result.summary.render(80), [" ▸ took 42s · 2 calls · bash×2 · 1 failed"]);
+});
+
+test("top-level and nested failures are both marked", () => {
+	const line = buildSummaryLine({
+		expanded: false,
+		ms: 3000,
+		tools: [
+			{ name: "bash", failed: true },
+			{ name: "codemode", failed: false, nested: [["read", 1]], nestedFailed: 1 },
+		],
+		fg: plainFg,
+		width: 120,
+	});
+	assert.deepEqual(line, " ▸ took 3s · 2 calls · bash×1 · codemode×1 (read×1) · 1 failed · 1 nested failed");
 });
 
 test("failed and interrupted turns fold too, and say so", () => {

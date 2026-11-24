@@ -10,7 +10,7 @@ const OPTIONS_ENTRY = "pi-turn-fold.options";
 
 interface Ui {
 	theme?: { fg?: (color: string, text: string) => string };
-	requestRender?(): void;
+	requestRender?(force?: boolean): void;
 }
 
 interface Fold {
@@ -119,6 +119,21 @@ function persist(pi: ExtensionAPI, record: FoldRecord): void {
 	}
 }
 
+/**
+ * Repaint outside the current frame: a request made while pi is composing a frame is swallowed and
+ * the screen keeps the older layout (rows spliced in by a fold never show up).
+ */
+function rerender(): void {
+	setTimeout(() => {
+		try {
+			state.chat?.invalidate?.();
+			state.ui?.requestRender?.(true);
+		} catch (error) {
+			warn("could not repaint", error);
+		}
+	}, 0);
+}
+
 /** Fold one turn and remember it, so `/fold turn N` and a reopened session can find it. */
 function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0]): FoldResult | undefined {
 	const holder: { fold?: Fold } = {};
@@ -129,7 +144,7 @@ function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0
 				holder.fold.record.expanded = expanded;
 				persist(pi, holder.fold.record);
 			}
-			state.ui?.requestRender?.();
+			rerender();
 		},
 	});
 	if (!result) return undefined;
@@ -154,7 +169,7 @@ function settle(pi: ExtensionAPI, aborted: boolean, outcome: string | undefined)
 		outcome: aborted ? "aborted" : outcome,
 		fg: fg(),
 	});
-	state.ui?.requestRender?.();
+	rerender();
 }
 
 /** Re-apply the folds a previous session left in the branch, newest last. */
@@ -187,11 +202,14 @@ function restore(pi: ExtensionAPI, branch: readonly unknown[] | undefined): void
 			ms: record.ms,
 			outcome: record.outcome,
 			tools: record.tools,
-			expanded: record.expanded,
+			// shortcut: reopened turns always start collapsed; an expanded restore paints a stale
+			// first frame (pi composes it while we are still folding), upgrade when pi exposes a
+			// repaint that lands after the current frame.
+			expanded: false,
 			fg: fg(),
 		});
 	}
-	state.ui?.requestRender?.();
+	rerender();
 }
 
 function runCommand(pi: ExtensionAPI, args: string): void {
