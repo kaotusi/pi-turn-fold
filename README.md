@@ -39,7 +39,7 @@ releases the live row and stops folding; `/fold on` starts again with the next t
 ## Install
 
 ```bash
-pi install /path/to/pi-turn-fold
+pi install github.com/kaotusi/pi-turn-fold
 # or try it without touching settings:
 pi -e /path/to/pi-turn-fold/extensions/index.ts
 ```
