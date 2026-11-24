@@ -7,6 +7,7 @@ import {
 	foldTurn,
 	formatDuration,
 	isFinalReply,
+	hasToolCall,
 	lastUserIndex,
 	nestedFailures,
 	nestedTools,
@@ -258,6 +259,51 @@ test("expanded state survives a re-render at the same width", () => {
 	assert.deepEqual(summary.render(80), [" ▸ took 42s · 1 call · read×1"]);
 	summary.setExpanded(true);
 	assert.deepEqual(summary.render(80), [" ▾ took 42s · 1 call · read×1"]);
+});
+
+test("a running row says working and keeps the clock and counts", () => {
+	const line = buildSummaryLine({
+		expanded: false,
+		ms: 12000,
+		tools: [
+			{ name: "read", failed: false },
+			{ name: "bash", failed: false },
+		],
+		outcome: "running",
+		fg: plainFg,
+		width: 120,
+	});
+	assert.deepEqual(line, " ▸ working · 12s · 2 calls · read×1 · bash×1");
+});
+
+test("a live row rebuilds when a second or a call moves, and settles in place", () => {
+	let now = 0;
+	let outcome = "running";
+	let tools: ToolEntry[] = [{ name: "read", failed: false }];
+	const row = new SummaryLine({
+		expanded: false,
+		ms: 0,
+		tools,
+		outcome,
+		fg: plainFg,
+		refresh: () => ({ ms: now, tools, outcome }),
+	});
+	assert.deepEqual(row.render(80), [" ▸ working · 0s · 1 call · read×1"]);
+	now = 400;
+	assert.deepEqual(row.render(80), [" ▸ working · 0s · 1 call · read×1"], "the same second reuses the row");
+	now = 5000;
+	assert.deepEqual(row.render(80), [" ▸ working · 5s · 1 call · read×1"]);
+	tools = [...tools, { name: "bash", failed: false }];
+	assert.deepEqual(row.render(80), [" ▸ working · 5s · 2 calls · read×1 · bash×1"]);
+	outcome = "completed";
+	row.update({ ms: now, tools, outcome });
+	assert.deepEqual(row.render(80), [" ▸ took 5s · 2 calls · read×1 · bash×1"]);
+});
+
+test("an assistant message with a pending tool call is process, not the answer", () => {
+	assert.equal(hasToolCall(new Assistant([{ type: "toolCall" }])), true);
+	assert.equal(hasToolCall(new Assistant([{ type: "text", text: "done" }])), false);
+	assert.equal(isFinalReply(new Assistant([{ type: "text", text: "done" }]), Assistant), true);
 });
 
 test("final reply detection", () => {

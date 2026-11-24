@@ -1,18 +1,25 @@
 # pi-turn-fold
 
-Fold one pi agent turn into a single clickable row.
+Fold one pi agent turn into a single clickable row — while it runs, not afterwards.
 
 ```
  用 bash 跑 5 条命令…
 
- ▸ took 12s · 6 calls · bash×6 · 1 failed
+ ▸ working · 12s · 4 calls · bash×3 · read×1
 
  五条命令各自执行完毕。
+
+ ▸ took 14s · 6 calls · bash×6 · 1 failed
 ```
+
+The row is live: process rows are hidden as they arrive, the clock and call counts
+move, and when the turn settles the row locks to `took …` and the final reply is
+released underneath it.
 
 Click the row to show what it replaced (the tool rows, groups and intermediate
 messages drawn by [pi-cc-extensions](https://github.com/minuque/pi-cc-extensions)),
-marked with a `│` gutter, click again to fold it back.
+marked with a `│` gutter, click again to fold it back. An expanded turn stays
+expanded for the rest of that turn; the extension never folds it back on its own.
 
 Sub-calls a tool reports in its own result (pi's codemode `details.calls`) are
 counted under it: `codemode×1 (bash×3 read×2)`.
@@ -26,7 +33,8 @@ Commands:
 ```
 
 Folds survive a restart: each one is appended to the session, and a reopened
-session re-applies them after the transcript is rendered.
+session re-applies them after the transcript is rendered. `/fold off` mid-turn
+releases the live row and stops folding; `/fold on` starts again with the next turn.
 
 ## Install
 
@@ -38,13 +46,22 @@ pi -e /path/to/pi-turn-fold/extensions/index.ts
 
 ## How it works
 
-pi has no message-level renderer, so the extension caps
-`InteractiveMode.prototype.addMessageToChat` to capture the live `chatContainer`,
-then on `agent_settled`:
+pi has no message-level renderer and tool rows are built outside the message path,
+so the extension caps three seams on `InteractiveMode.prototype`:
 
-1. finds the turn's `UserMessageComponent` and the final text reply,
-2. hides every component in between (`render()` → `[]`),
-3. splices a `SummaryLine` + two spacers directly under the user message.
+- `addMessageToChat` — to learn which components the turn added,
+- `renderSessionItems` — to re-apply folds when a session is reopened,
+- plus `tool_execution_start`/`tool_execution_end` for the live counts.
+
+On `before_agent_start` it creates a live record and a `SummaryLine`, and from then
+on:
+
+1. every component the turn adds is hidden the moment it is added (`render()` → `[]`),
+2. the summary row is spliced in above them, under the user message,
+3. a 500 ms tick re-sweeps the container (streaming text and cc rows bypass the
+   message hook) and marks the row dirty — nothing invalidates inside a frame,
+4. on `agent_settled` the row locks to `took …`, the final reply is shown, and the
+   whole thing is appended to the session.
 
 The summary row is a real child of the chat container, which is what makes clicks
 work: pi dispatches mouse events over the component tree, not over rendered text.
@@ -57,11 +74,13 @@ and expanding still shows the error rows verbatim.
 
 ## Status
 
-Stage S3 done. Not done: folding while a turn is still running (only settled turns
-fold).
+Stage S4 done: turns fold while they run.
 
 Known edges:
 
+- The live row advances on a 500 ms tick, so a count can lag a fast tool by half a
+  second; the clock is cached per second.
+- A turn with no tool calls is not folded — it has nothing to hide.
 - A reopened turn always comes back collapsed; an expanded restore paints a stale
   first frame, so the expanded state is not restored.
 - Click coordinates must be read off the screen right before clicking: expanding a
@@ -70,6 +89,6 @@ Known edges:
 ## Dev
 
 ```bash
-npm test        # node --test, 15 checks
+npm test        # node --test, 18 checks
 npm run typecheck
 ```

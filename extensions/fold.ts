@@ -73,6 +73,19 @@ export function unrailComponent(component: FoldableComponent | undefined): void 
 	component.invalidate?.();
 }
 
+/** Show a set of turn components under a rail, or hide them: one place, so live and folded turns agree. */
+export function applyHidden(components: Iterable<FoldableComponent>, expanded: boolean): void {
+	for (const component of components) {
+		if (expanded) {
+			showComponent(component);
+			railComponent(component);
+		} else {
+			unrailComponent(component);
+			hideComponent(component);
+		}
+	}
+}
+
 /** Tools rendered by one entry: either a bare tool component or a group (cc-style) of them. */
 export function toolsOf(component: FoldableComponent | undefined, ToolClass: new (...args: never[]) => unknown): FoldableComponent[] {
 	if (!component) return [];
@@ -80,6 +93,12 @@ export function toolsOf(component: FoldableComponent | undefined, ToolClass: new
 	const children = component.children;
 	if (!Array.isArray(children)) return [];
 	return (children as FoldableComponent[]).filter((child) => child instanceof ToolClass);
+}
+
+/** An assistant message that still carries a pending tool call — process, not the answer. */
+export function hasToolCall(component: FoldableComponent | undefined): boolean {
+	const message = component?.lastMessage as { content?: Array<{ type?: string }> } | undefined;
+	return Array.isArray(message?.content) && message.content.some((block) => block?.type === "toolCall");
 }
 
 /** The turn's answer: an assistant message with visible text and no pending tool call. */
@@ -150,10 +169,10 @@ export interface SummaryLineInput {
 
 function summaryParts(expanded: boolean, ms: number | undefined, outcome: string | undefined, tools: readonly ToolEntry[], fg: Fg, withNested: boolean): string[] {
 	const nested = withNested ? nestedCounts(tools) : new Map<string, Array<[string, number]>>();
-	const parts = [
-		fg("muted", `${expanded ? "▾" : "▸"} took ${formatDuration(ms)}`),
-		fg("muted", `${tools.length} ${tools.length === 1 ? "call" : "calls"}`),
-	];
+	const running = outcome === "running";
+	const parts = [fg("muted", `${expanded ? "▾" : "▸"} ${running ? "working" : `took ${formatDuration(ms)}`}`)];
+	if (running) parts.push(fg("muted", formatDuration(ms)));
+	parts.push(fg("muted", `${tools.length} ${tools.length === 1 ? "call" : "calls"}`));
 	for (const [name, count] of toolCounts(tools)) {
 		const inner = nested.get(name);
 		const detail = inner ? ` (${inner.map(([nestedName, nestedCount]) => `${nestedName}×${nestedCount}`).join(" ")})` : "";
@@ -185,17 +204,36 @@ export interface FoldRecord {
 	expanded: boolean;
 }
 
+/** Numbers a live row recomputes on every render: the clock keeps running, calls keep arriving. */
+export interface SummaryRefresh {
+	(): { ms?: number; tools?: readonly ToolEntry[]; outcome?: string };
+}
+
+export interface SummaryLineOptions extends Omit<SummaryLineInput, "width"> {
+	refresh?: SummaryRefresh;
+}
+
 /** One clickable row standing in for a folded turn. */
 export class SummaryLine implements FoldableComponent {
 	expanded = false;
-	private readonly options: Omit<SummaryLineInput, "width">;
+	private values: Omit<SummaryLineInput, "width">;
+	private readonly refresh?: SummaryRefresh;
 	private readonly onToggle?: (expanded: boolean) => void;
-	private cache?: { width: number; line: string };
+	private cache?: { width: number; seconds: number; calls: number; outcome?: string; expanded: boolean; line: string };
 
-	constructor(options: Omit<SummaryLineInput, "width">, onToggle?: (expanded: boolean) => void) {
-		this.options = options;
-		this.expanded = options.expanded;
+	constructor(options: SummaryLineOptions, onToggle?: (expanded: boolean) => void) {
+		this.values = { expanded: options.expanded, ms: options.ms, tools: options.tools, outcome: options.outcome, fg: options.fg };
+		this.expanded = options.expanded ?? false;
+		this.refresh = options.refresh;
 		this.onToggle = onToggle;
+	}
+
+	/** Take new numbers as a run progresses or settles. */
+	update(values: { ms?: number; tools?: readonly ToolEntry[]; outcome?: string }): void {
+		if (values.ms !== undefined) this.values.ms = values.ms;
+		if (values.tools) this.values.tools = values.tools;
+		if (values.outcome !== undefined) this.values.outcome = values.outcome;
+		this.invalidate();
 	}
 
 	setExpanded(expanded: boolean): void {
@@ -210,11 +248,18 @@ export class SummaryLine implements FoldableComponent {
 	}
 
 	render(width: number): string[] {
-		if (this.cache?.width === width) {
-			return [this.cache.line];
+		const live = this.refresh?.();
+		const ms = live?.ms ?? this.values.ms;
+		const tools = live?.tools ?? this.values.tools;
+		const outcome = live?.outcome ?? this.values.outcome;
+		const seconds = Math.round(Math.max(0, ms ?? 0) / 1000);
+		const cache = this.cache;
+		// the clock ticks every frame: rebuild the row only when a second, the count or the outcome moved
+		if (cache && cache.width === width && cache.seconds === seconds && cache.calls === tools.length && cache.outcome === outcome && cache.expanded === this.expanded) {
+			return [cache.line];
 		}
-		const line = buildSummaryLine({ ...this.options, expanded: this.expanded, width });
-		this.cache = { width, line };
+		const line = buildSummaryLine({ expanded: this.expanded, ms, tools, outcome, fg: this.values.fg, width });
+		this.cache = { width, seconds, calls: tools.length, outcome, expanded: this.expanded, line };
 		return [line];
 	}
 
@@ -285,21 +330,10 @@ function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded,
 	const record: FoldRecord = { ordinal, ms, outcome, tools: [...tools], expanded };
 	const summary = new SummaryLine({ ...record, fg }, (next) => {
 		record.expanded = next;
-		for (const component of hidden) {
-			if (next) {
-				showComponent(component);
-				railComponent(component);
-			} else {
-				unrailComponent(component);
-				hideComponent(component);
-			}
-		}
+		applyHidden(hidden, next);
 		onToggle?.(next);
 	});
-	for (const component of hidden) {
-		if (expanded) railComponent(component);
-		else hideComponent(component);
-	}
+	applyHidden(hidden, expanded);
 	children.splice(userIndex + 1, 0, new Spacer(1), summary, new Spacer(1));
 	return { summary, hidden, record };
 }

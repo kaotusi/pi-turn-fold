@@ -1,7 +1,24 @@
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Spacer } from "@earendil-works/pi-tui";
 import type { Container } from "@earendil-works/pi-tui";
-import { foldInterval, lastUserIndex, type FoldRecord, type FoldResult, type FoldableComponent, type Fg, type SummaryLine } from "./fold.ts";
+import {
+	applyHidden,
+	foldInterval,
+	hasToolCall,
+	isFinalReply,
+	lastUserIndex,
+	nestedFailures,
+	nestedTools,
+	showComponent,
+	SummaryLine,
+	unrailComponent,
+	type FoldRecord,
+	type FoldResult,
+	type FoldableComponent,
+	type Fg,
+	type ToolEntry,
+} from "./fold.ts";
 
 const HOOK = Symbol.for("pi-turn-fold.chat-hook");
 const HOOK_RENDER = Symbol.for("pi-turn-fold.render-hook");
@@ -15,8 +32,23 @@ interface Ui {
 
 interface Fold {
 	summary: SummaryLine;
-	hidden: FoldableComponent[];
 	record: FoldRecord;
+}
+
+/** A run that is still going: its process components are hidden as they arrive, behind one live row. */
+interface Live {
+	ordinal: number;
+	userIndex: number;
+	startedAt: number;
+	outcome: string;
+	calls: Map<string, ToolEntry>;
+	summary: SummaryLine;
+	hidden: Set<FoldableComponent>;
+	record: FoldRecord;
+	inserted: boolean;
+	expanded: boolean;
+	reply?: FoldableComponent;
+	timer?: ReturnType<typeof setInterval>;
 }
 
 interface FoldState {
@@ -26,6 +58,7 @@ interface FoldState {
 	outcome?: string;
 	foldsEnabled: boolean;
 	folds: Map<number, Fold>;
+	live?: Live;
 }
 
 const state: FoldState = { foldsEnabled: true, folds: new Map() };
@@ -78,6 +111,13 @@ function installChatHook(): boolean {
 	const wrapped: AddMessageToChat = function (this: { chatContainer?: Container }, message, options) {
 		if (this?.chatContainer) state.chat = this.chatContainer;
 		original.call(this, message, options);
+		if (state.live) {
+			try {
+				sweep(state.live);
+			} catch (error) {
+				warn("could not hide the running turn", error);
+			}
+		}
 	};
 	wrapped[HOOK] = true;
 	proto.addMessageToChat = wrapped;
@@ -134,6 +174,153 @@ function rerender(): void {
 	}, 0);
 }
 
+/** Start the live row: everything the run adds to the chat goes behind it until it settles. */
+function beginLive(pi: ExtensionAPI): void {
+	releaseLive(state.live);
+	const record: FoldRecord = { ordinal: 0, outcome: "running", tools: [], expanded: false };
+	const live: Live = {
+		ordinal: 0,
+		userIndex: -1,
+		startedAt: Date.now(),
+		outcome: "running",
+		calls: new Map(),
+		hidden: new Set(),
+		record,
+		inserted: false,
+		expanded: false,
+	// SAFETY: the row needs the live record it belongs to; it is attached one statement below, before any render.
+	summary: undefined as unknown as SummaryLine,
+	};
+	live.summary = new SummaryLine(
+		{
+			expanded: false,
+			ms: 0,
+			tools: [],
+			outcome: "running",
+			fg: fg(),
+			refresh: () => ({
+				ms: live.outcome === "running" ? Date.now() - live.startedAt : live.record.ms,
+				tools: [...live.calls.values()],
+				outcome: live.outcome,
+			}),
+		},
+		(expanded) => {
+			live.expanded = expanded;
+			live.record.expanded = expanded;
+			applyHidden(live.hidden, expanded);
+			// the answer stays out of the rail either way
+			if (live.reply) {
+				showComponent(live.reply);
+				unrailComponent(live.reply);
+			}
+			persist(pi, live.record);
+			rerender();
+		},
+	);
+	state.live = live;
+	live.timer = setInterval(() => {
+		if (state.live !== live) return;
+		// rows pi and cc append on their own (streaming text, notices) never pass the message hook
+		sweep(live);
+		live.summary.invalidate();
+		rerender();
+	}, 500);
+	live.timer.unref?.();
+}
+
+/** The chat children, with this run's user message located on first use. */
+function resolveLive(live: Live): FoldableComponent[] | undefined {
+	const children = state.chat?.children as FoldableComponent[] | undefined;
+	if (!Array.isArray(children)) return undefined;
+	if (live.userIndex < 0) {
+		const index = lastUserIndex(children, UserMessageComponent);
+		if (index < 0) return undefined;
+		live.userIndex = index;
+		live.ordinal = children.slice(0, index + 1).filter((component) => component instanceof UserMessageComponent).length - 1;
+		live.record.ordinal = live.ordinal;
+	}
+	return children;
+}
+
+/** Process, not answer: tool rows, cc's tool groups, tool-carrying assistant messages and mid-run notices. */
+function isProcess(component: FoldableComponent, live: Live): boolean {
+	if (component === live.reply) return false;
+	if (component instanceof ToolExecutionComponent) return true;
+	if (typeof (component as { toolName?: unknown }).toolName === "string") return true;
+	if (component instanceof AssistantMessageComponent) {
+		// before the first tool call an answer still streams plainly: there is no row to hide it behind
+		return live.calls.size > 0 || hasToolCall(component);
+	}
+	// sub-agent notices and other custom rows: part of the run once it is doing tools
+	return live.calls.size > 0;
+}
+
+/** Hide everything this run added after its user message; insert the row the first time. */
+function sweep(live: Live): void {
+	const children = resolveLive(live);
+	if (!children) return;
+	for (let index = live.userIndex + 1; index < children.length; index++) {
+		const component = children[index];
+		if (!component || component === live.summary || component instanceof Spacer) continue;
+		if (component instanceof UserMessageComponent) break;
+		if (isProcess(component, live)) live.hidden.add(component);
+	}
+	if (live.hidden.size === 0) return;
+	if (!live.inserted) {
+		children.splice(live.userIndex + 1, 0, new Spacer(1), live.summary, new Spacer(1));
+		live.inserted = true;
+		state.folds.set(live.record.ordinal, { summary: live.summary, record: live.record });
+	}
+	applyHidden(live.hidden, live.expanded);
+}
+
+/** Undo a live row completely: the process comes back, the row goes away. */
+function releaseLive(live: Live | undefined): void {
+	if (!live) return;
+	if (live.timer) clearInterval(live.timer);
+	applyHidden(live.hidden, true);
+	if (live.reply) {
+		showComponent(live.reply);
+		unrailComponent(live.reply);
+	}
+	const children = state.chat?.children as FoldableComponent[] | undefined;
+	if (Array.isArray(children) && live.inserted) {
+		const index = children.indexOf(live.summary);
+		if (index > 0) children.splice(index - 1, 3);
+	}
+	if (state.live === live) state.live = undefined;
+}
+
+/** Settle the live row: `working` becomes `took`, the answer comes out, the record is persisted. */
+function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): void {
+	if (live.timer) clearInterval(live.timer);
+	live.outcome = outcome;
+	live.record.ms = ms;
+	live.record.outcome = outcome;
+	live.record.tools = [...live.calls.values()];
+	live.summary.update({ ms, outcome });
+	if (state.live === live) state.live = undefined;
+	const children = resolveLive(live);
+	const reply = children && [...children.slice(live.userIndex + 1)].reverse().find((component) => isFinalReply(component, AssistantMessageComponent));
+	if (reply) {
+		live.reply = reply;
+		live.hidden.delete(reply);
+	}
+	if (live.record.tools.length === 0) {
+		releaseLive(live);
+		rerender();
+		return;
+	}
+	sweep(live);
+	if (reply) {
+		showComponent(reply);
+		unrailComponent(reply);
+	}
+	applyHidden(live.hidden, live.expanded);
+	persist(pi, live.record);
+	rerender();
+}
+
 /** Fold one turn and remember it, so `/fold turn N` and a reopened session can find it. */
 function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0]): FoldResult | undefined {
 	const holder: { fold?: Fold } = {};
@@ -148,7 +335,7 @@ function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0
 		},
 	});
 	if (!result) return undefined;
-	holder.fold = { summary: result.summary, hidden: result.hidden, record: result.record };
+	holder.fold = { summary: result.summary, record: result.record };
 	state.folds.set(result.record.ordinal, holder.fold);
 	persist(pi, result.record);
 	return result;
@@ -156,9 +343,22 @@ function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0
 
 function settle(pi: ExtensionAPI, aborted: boolean, outcome: string | undefined): void {
 	const children = state.chat?.children as FoldableComponent[] | undefined;
-	const ms = state.runStart === undefined ? undefined : Date.now() - state.runStart;
+	const live = state.live;
+	let ms: number | undefined;
+	if (live) ms = Date.now() - live.startedAt;
+	else if (state.runStart !== undefined) ms = Date.now() - state.runStart;
 	state.runStart = undefined;
-	if (!Array.isArray(children) || !state.foldsEnabled) return;
+	if (!Array.isArray(children)) return;
+	const finalOutcome = aborted ? "aborted" : (outcome ?? "completed");
+	if (!state.foldsEnabled) {
+		releaseLive(live);
+		rerender();
+		return;
+	}
+	if (live) {
+		finishLive(pi, live, ms ?? 0, finalOutcome);
+		return;
+	}
 	foldAndTrack(pi, {
 		children,
 		userIndex: lastUserIndex(children, UserMessageComponent),
@@ -166,7 +366,7 @@ function settle(pi: ExtensionAPI, aborted: boolean, outcome: string | undefined)
 		AssistantClass: AssistantMessageComponent,
 		UserClass: UserMessageComponent,
 		ms,
-		outcome: aborted ? "aborted" : outcome,
+		outcome: finalOutcome,
 		fg: fg(),
 	});
 	rerender();
@@ -188,6 +388,8 @@ function restore(pi: ExtensionAPI, branch: readonly unknown[] | undefined): void
 	}
 	state.foldsEnabled = foldsEnabled;
 	state.folds.clear();
+	// a rebuilt transcript has no live row to keep in step
+	releaseLive(state.live);
 	// newest turn first: splicing a summary earlier never moves a later turn's user message
 	for (const record of [...records.values()].sort((left, right) => right.ordinal - left.ordinal)) {
 		const userIndices = (children as FoldableComponent[]).flatMap((component, index) => (component instanceof UserMessageComponent ? [index] : []));
@@ -218,6 +420,7 @@ function runCommand(pi: ExtensionAPI, args: string): void {
 	if (target === "on" || target === "off") {
 		state.foldsEnabled = target === "on";
 		pi.appendEntry(OPTIONS_ENTRY, { folds: state.foldsEnabled });
+		if (!state.foldsEnabled) releaseLive(state.live);
 		for (const fold of state.folds.values()) fold.summary.setExpanded(!state.foldsEnabled);
 		return;
 	}
@@ -254,6 +457,31 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 	pi.on("agent_start", () => {
 		state.runStart = Date.now();
 		state.outcome = undefined;
+		if (!state.live) beginLive(pi);
+	});
+
+	pi.on("before_agent_start", () => {
+		if (state.foldsEnabled) beginLive(pi);
+	});
+
+	pi.on("tool_execution_start", (event) => {
+		const live = state.live;
+		// nested calls belong to the tool that started them, not to the turn
+		if (!live || event.parentToolCallId) return;
+		live.calls.set(event.toolCallId, { name: event.toolName, failed: false });
+		live.summary.invalidate();
+		sweep(live);
+	});
+
+	pi.on("tool_execution_end", (event) => {
+		const live = state.live;
+		const entry = live?.calls.get(event.toolCallId);
+		if (!live || !entry) return;
+		entry.failed = event.isError === true;
+		entry.nested = nestedTools(event.result);
+		entry.nestedFailed = nestedFailures(event.result) || undefined;
+		live.summary.invalidate();
+		sweep(live);
 	});
 
 	pi.on("agent_before_settle", (event) => {
