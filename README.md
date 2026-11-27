@@ -31,11 +31,18 @@ Commands:
 /fold turn last   toggle the newest folded turn (or /fold turn 3)
 /fold on          fold turns again
 /fold off         unfold everything, stop folding new turns
+/fold doctor      which hooks this copy owns, what the shared state sees
 ```
 
 Folds survive a restart: each one is appended to the session, and a reopened
-session re-applies them after the transcript is rendered. `/fold off` mid-turn
-releases the live row and stops folding; `/fold on` starts again with the next turn.
+session re-applies them after the transcript is rendered. A `/reload` loads a
+second copy of the extension, so the state lives on `globalThis` and the hooks are
+unwrapped and installed again rather than stacked; the fold is re-applied to the
+rebuilt transcript, and anything cc mounts into a folded turn afterwards is
+folded on the next paint. `/fold doctor` prints `mine` per hook when that is
+healthy — `stale` means a previous copy's wrapper is still in place.
+`/fold off` mid-turn releases the live row and stops folding; `/fold on` starts
+again with the next turn.
 
 ## Install
 

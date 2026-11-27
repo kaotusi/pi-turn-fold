@@ -31,7 +31,16 @@ export interface ToolEntry {
 
 export type Fg = (color: string, text: string) => string;
 
-const originalRenders = new WeakMap<FoldableComponent, (width: number) => readonly string[]>();
+const RENDERS_KEY = Symbol.for("pi-turn-fold.hidden-renders");
+const RAILS_KEY = Symbol.for("pi-turn-fold.railed-renders");
+
+/**
+ * Per-component bookkeeping, one map per process: /reload evaluates this file again, and the second copy
+ * has to hide and show the components the first copy already touched.
+ */
+const originalRenders: WeakMap<FoldableComponent, (width: number) => readonly string[]> = ((globalThis as Record<symbol, unknown>)[
+	RENDERS_KEY
+] ??= new WeakMap()) as WeakMap<FoldableComponent, (width: number) => readonly string[]>;
 
 /** Replace a component's rows with nothing, remembering the original renderer. */
 export function hideComponent(component: FoldableComponent | undefined): void {
@@ -39,6 +48,11 @@ export function hideComponent(component: FoldableComponent | undefined): void {
 	originalRenders.set(component, component.render);
 	component.render = () => [];
 	component.invalidate?.();
+}
+
+/** Already hidden by a fold: the check that keeps a repaint from touching the same component twice. */
+export function isHidden(component: FoldableComponent | undefined): boolean {
+	return Boolean(component && originalRenders.has(component));
 }
 
 export function showComponent(component: FoldableComponent | undefined): void {
@@ -50,7 +64,9 @@ export function showComponent(component: FoldableComponent | undefined): void {
 	component.invalidate?.();
 }
 
-const originalRailRenders = new WeakMap<FoldableComponent, (width: number) => readonly string[]>();
+const originalRailRenders: WeakMap<FoldableComponent, (width: number) => readonly string[]> = ((globalThis as Record<symbol, unknown>)[
+	RAILS_KEY
+] ??= new WeakMap()) as WeakMap<FoldableComponent, (width: number) => readonly string[]>;
 
 /**
  * Mark an expanded component as part of a turn: `│ ` in front. The child keeps the full width —

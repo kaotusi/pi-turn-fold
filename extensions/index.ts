@@ -1,12 +1,13 @@
 import { appendFileSync } from "node:fs";
 import { AssistantMessageComponent, InteractiveMode, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Spacer } from "@earendil-works/pi-tui";
+import { Spacer, Text } from "@earendil-works/pi-tui";
 import type { Container } from "@earendil-works/pi-tui";
 import {
 	applyHidden,
 	foldInterval,
 	hideComponent,
+	isHidden,
 	isThinkingBlock,
 	lastUserIndex,
 	nestedFailures,
@@ -23,11 +24,11 @@ import {
 	type ToolEntry,
 } from "./fold.ts";
 
-const HOOK = Symbol.for("pi-turn-fold.chat-hook");
-const HOOK_RENDER = Symbol.for("pi-turn-fold.render-hook");
-const HOOK_ADD_CHILD = Symbol.for("pi-turn-fold.add-child-hook");
-const HOOK_PAINT = Symbol.for("pi-turn-fold.paint-hook");
-const HOOK_THINKING = Symbol.for("pi-turn-fold.thinking-filter");
+/** The function a wrapper wrapped, so re-installing unwraps instead of stacking. */
+const HOOK_INNER = Symbol.for("pi-turn-fold.hook-inner");
+/** The module instance that installed a wrapper; a /reload is a new one. */
+const HOOK_OWNER = Symbol.for("pi-turn-fold.hook-owner");
+const STATE_KEY = Symbol.for("pi-turn-fold.state");
 const TURN_ENTRY = "pi-turn-fold.turn";
 const OPTIONS_ENTRY = "pi-turn-fold.options";
 
@@ -39,6 +40,8 @@ interface Ui {
 interface Fold {
 	summary: SummaryLine;
 	record: FoldRecord;
+	/** Components the turn picked up after it settled (cc's tool group), hidden with the fold and shown with it. */
+	extra: Set<FoldableComponent>;
 }
 
 /** A run that is still going: its process components are hidden as they arrive, behind one live row. */
@@ -70,7 +73,14 @@ interface FoldState {
 	live?: Live;
 }
 
-const state: FoldState = { foldsEnabled: true, folds: new Map() };
+/** This module instance's token: its hooks are the ones that belong to this copy of the extension. */
+const owner = {};
+
+/**
+ * One state per process, not per module instance. /reload loads a second copy of this file; every hook
+ * (the first copy's included) has to read the same live row, fold records and chat container.
+ */
+const state: FoldState = ((globalThis as Record<symbol, unknown>)[STATE_KEY] ??= { foldsEnabled: true, folds: new Map() }) as FoldState;
 
 /**
  * The component classes every turn decision tests against. pi exports them; the tests swap in fakes,
@@ -136,20 +146,16 @@ function fg(): Fg {
  */
 type ChatHost = { chatContainer?: Container; sessionManager?: { getBranch?(): readonly unknown[] } };
 
-type AddMessageToChat = ((this: ChatHost, message: unknown, options?: unknown) => void) & {
-	[HOOK]?: boolean;
-};
+type AddMessageToChat = (this: ChatHost, message: unknown, options?: unknown) => void;
 
-type RenderSessionItems = ((this: ChatHost, items: unknown, meta?: unknown, options?: unknown) => void) & {
-	[HOOK_RENDER]?: boolean;
-};
+type RenderSessionItems = (this: ChatHost, items: unknown, meta?: unknown, options?: unknown) => void;
 
-type AddChildHook = ((this: Container, child: unknown) => void) & { [HOOK_ADD_CHILD]?: boolean };
+type AddChildHook = (this: Container, child: unknown) => void;
 
-/** addChild after hideThinking marked it, so the answer's container is not wrapped twice. */
-type HookedAddChild = AddChildHook & { [HOOK_THINKING]?: boolean };
+type PaintHook = (this: Container, width: number) => readonly string[];
 
-type PaintHook = ((this: Container, width: number) => readonly string[]) & { [HOOK_PAINT]?: boolean };
+/** A wrapped method, remembering what it wrapped and which module instance installed it. */
+type Hooked<F> = F & { [HOOK_INNER]?: F; [HOOK_OWNER]?: unknown };
 
 /**
  * The live row is spliced right under this turn's user message, before any process row exists, so the
@@ -159,7 +165,7 @@ function insertSummary(live: Live, children: FoldableComponent[]): boolean {
 	if (live.inserted || live.userIndex < 0) return false;
 	children.splice(live.userIndex + 1, 0, new Spacer(1), live.summary, new Spacer(1));
 	live.inserted = true;
-	state.folds.set(live.record.ordinal, { summary: live.summary, record: live.record });
+	state.folds.set(live.record.ordinal, { summary: live.summary, record: live.record, extra: new Set() });
 	debug("summary-inserted", () => ({ ordinal: live.record.ordinal, userIndex: live.userIndex }));
 	return true;
 }
@@ -198,16 +204,58 @@ function placeUserMessage(live: Live, component: FoldableComponent, children: Fo
 }
 
 /**
+ * Wrap a method on `holder` with a wrapper owned by this module instance — always. /reload loads a
+ * second copy of this file, and the wrapper the first copy left closes over the first copy's closures;
+ * it has to be replaced. Our own earlier wrapper is unwrapped first, so installs never stack.
+ */
+function rewrap<F extends (...args: never[]) => unknown>(holder: Record<string, unknown>, name: string, make: (inner: F) => F): boolean {
+	const current = holder[name] as Hooked<F> | undefined;
+	if (typeof current !== "function") return false;
+	if (current[HOOK_OWNER] === owner) return true;
+	// only a wrapper of ours is unwrapped: another extension's layer stays where it is
+	const previous = (current[HOOK_OWNER] === undefined ? current : current[HOOK_INNER]) as F | undefined;
+	const inner = typeof previous === "function" ? previous : current;
+	const wrapped = make(inner) as Hooked<F>;
+	wrapped[HOOK_INNER] = inner;
+	wrapped[HOOK_OWNER] = owner;
+	holder[name] = wrapped;
+	return true;
+}
+
+/**
+ * A folded turn gets new components after it settled: cc regroups the restored tools once /reload mounts
+ * them, and a group is a component no fold ever saw. Every paint, hide what landed inside a collapsed
+ * fold; components already hidden are skipped, so the scan is all this costs per frame.
+ */
+function resweepFolds(): void {
+	const children = state.chat?.children as FoldableComponent[] | undefined;
+	if (!Array.isArray(children) || state.folds.size === 0) return;
+	const live = state.live?.summary;
+	for (const fold of state.folds.values()) {
+		if (fold.summary === live || fold.summary.expanded) continue;
+		const start = children.indexOf(fold.summary);
+		if (start < 0) continue;
+		const end = children.findIndex((component, index) => index > start && component instanceof classes.User);
+		const interval = children.slice(start + 1, end < 0 ? children.length : end);
+		const replies = pickVisibleTexts(interval, classes.Assistant);
+		const stale = interval.filter((component) => !(component instanceof Spacer) && !replies.includes(component) && !isHidden(component));
+		if (stale.length === 0) continue;
+		debug("resweep", () => ({ ordinal: fold.record.ordinal, names: stale.map(nameOf) }));
+		for (const component of stale) fold.extra.add(component);
+		applyHidden(stale, false);
+	}
+}
+
+/**
  * pi and cc both append process components straight to the chat container; wrapping addChild folds them
  * in the same call that attaches them, so nothing of the run is ever painted.
  */
 function attachChat(chat: Container): void {
 	state.chat = chat;
 	// SAFETY: chat is a pi-tui Container; its instance hooks are only read and rewritten member by member.
-	const holder = chat as unknown as { addChild?: AddChildHook; render?: PaintHook };
-	const addChild = holder.addChild;
-	if (typeof addChild === "function" && !addChild[HOOK_ADD_CHILD]) {
-		const wrapped: AddChildHook = function (this: Container, child) {
+	const holder = chat as unknown as Record<string, unknown>;
+	rewrap<AddChildHook>(holder, "addChild", (addChild) =>
+		function (this: Container, child) {
 			const component = child as FoldableComponent | undefined;
 			const live = state.live;
 			if (live && component) {
@@ -224,13 +272,10 @@ function attachChat(chat: Container): void {
 				}
 			}
 			addChild.call(this, child);
-		};
-		wrapped[HOOK_ADD_CHILD] = true;
-		holder.addChild = wrapped;
-	}
-	const render = holder.render;
-	if (typeof render === "function" && !render[HOOK_PAINT]) {
-		const wrapped: PaintHook = function (this: Container, width) {
+		},
+	);
+	rewrap<PaintHook>(holder, "render", (render) =>
+		function (this: Container, width) {
 			// last line of defence: a component that slipped past addChild is folded before it is painted
 			if (state.live && !state.live.closed) {
 				try {
@@ -239,11 +284,14 @@ function attachChat(chat: Container): void {
 					warn("could not fold before paint", error);
 				}
 			}
+			try {
+				resweepFolds();
+			} catch (error) {
+				warn("could not fold the restored turns before paint", error);
+			}
 			return render.call(this, width);
-		};
-		wrapped[HOOK_PAINT] = true;
-		holder.render = wrapped;
-	}
+		},
+	);
 }
 
 /**
@@ -254,16 +302,13 @@ function hideThinking(component: FoldableComponent): void {
 	const container = (component as { contentContainer?: Container }).contentContainer;
 	if (!container) return;
 	// SAFETY: a chat component is a Container whose children array and addChild method are the only members read.
-	const holder = container as unknown as { addChild?: HookedAddChild; children?: unknown[] };
-	const addChild = holder.addChild;
-	if (typeof addChild === "function" && !addChild[HOOK_THINKING]) {
-		const wrapped: HookedAddChild = function (this: Container, child) {
+	const holder = container as unknown as Record<string, unknown>;
+	rewrap<AddChildHook>(holder, "addChild", (addChild) =>
+		function (this: Container, child) {
 			if (!isThinkingBlock(child as FoldableComponent)) addChild.call(this, child);
-		};
-		wrapped[HOOK_THINKING] = true;
-		holder.addChild = wrapped;
-	}
-	const children = holder.children;
+		},
+	);
+	const children = holder.children as unknown[] | undefined;
 	if (Array.isArray(children)) {
 		const kept = children.filter((child) => !isThinkingBlock(child as FoldableComponent));
 		if (kept.length !== children.length) children.splice(0, children.length, ...kept);
@@ -273,35 +318,33 @@ function hideThinking(component: FoldableComponent): void {
 function installChatHook(): boolean {
 	// SAFETY: the class is a real constructor; only its prototype surface is read, member by member.
 	const proto = (InteractiveMode as unknown as { prototype?: Record<string, unknown> })?.prototype;
-	const original = proto?.addMessageToChat as AddMessageToChat | undefined;
-	if (typeof original !== "function") {
+	if (!proto) return false;
+	const installed = rewrap<AddMessageToChat>(proto, "addMessageToChat", (original) =>
+		function (this: ChatHost, message, options) {
+			if (this?.chatContainer) attachChat(this.chatContainer);
+			const before = this?.chatContainer?.children.length;
+			original.call(this, message, options);
+			const children = this?.chatContainer?.children;
+			debug("add-message", () => ({
+				role: (message as { role?: string } | undefined)?.role,
+				before,
+				after: children?.length,
+				added: before === undefined || !children ? undefined : nameOf(children[children.length - 1] as FoldableComponent),
+			}));
+			const live = state.live;
+			if (live && !live.closed) {
+				try {
+					sweep(live);
+				} catch (error) {
+					warn("could not hide the running turn", error);
+				}
+			}
+		},
+	);
+	if (!installed) {
 		warn("InteractiveMode.addMessageToChat not found; turn folding disabled");
 		return false;
 	}
-	if (!proto) return false;
-	if (original[HOOK]) return true;
-	const wrapped: AddMessageToChat = function (this: { chatContainer?: Container }, message, options) {
-		if (this?.chatContainer) attachChat(this.chatContainer);
-		const before = this?.chatContainer?.children.length;
-		original.call(this, message, options);
-		const children = this?.chatContainer?.children;
-		debug("add-message", () => ({
-			role: (message as { role?: string } | undefined)?.role,
-			before,
-			after: children?.length,
-			added: before === undefined || !children ? undefined : nameOf(children[children.length - 1] as FoldableComponent),
-		}));
-		const live = state.live;
-		if (live && !live.closed) {
-			try {
-				sweep(live);
-			} catch (error) {
-				warn("could not hide the running turn", error);
-			}
-		}
-	};
-	wrapped[HOOK] = true;
-	proto.addMessageToChat = wrapped;
 	return true;
 }
 
@@ -312,24 +355,19 @@ function installChatHook(): boolean {
 function installRenderHook(pi: ExtensionAPI): boolean {
 	// SAFETY: the class is a real constructor; only its prototype surface is read, member by member.
 	const proto = (InteractiveMode as unknown as { prototype?: Record<string, unknown> })?.prototype;
-	const original = proto?.renderSessionItems as RenderSessionItems | undefined;
-	if (typeof original !== "function") {
-		warn("InteractiveMode.renderSessionItems not found; saved folds cannot be restored");
-		return false;
-	}
 	if (!proto) return false;
-	if (original[HOOK_RENDER]) return true;
-	const wrapped: RenderSessionItems = function (this: ChatHost, items, meta, options) {
-		original.call(this, items, meta, options);
-		try {
-			restore(pi, this.sessionManager?.getBranch?.());
-		} catch (error) {
-			warn("restore failed", error);
-		}
-	};
-	wrapped[HOOK_RENDER] = true;
-	proto.renderSessionItems = wrapped;
-	return true;
+	const installed = rewrap<RenderSessionItems>(proto, "renderSessionItems", (original) =>
+		function (this: ChatHost, items, meta, options) {
+			original.call(this, items, meta, options);
+			try {
+				restore(pi, this.sessionManager?.getBranch?.());
+			} catch (error) {
+				warn("restore failed", error);
+			}
+		},
+	);
+	if (!installed) warn("InteractiveMode.renderSessionItems not found; saved folds cannot be restored");
+	return installed;
 }
 
 function persist(pi: ExtensionAPI, record: FoldRecord): void {
@@ -636,13 +674,15 @@ function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0
 		onToggle: (expanded) => {
 			if (holder.fold) {
 				holder.fold.record.expanded = expanded;
+				// what the turn picked up after it settled goes with it, in both directions
+				applyHidden(holder.fold.extra, expanded);
 				persist(pi, holder.fold.record);
 			}
 			rerender();
 		},
 	});
 	if (!result) return undefined;
-	holder.fold = { summary: result.summary, record: result.record };
+	holder.fold = { summary: result.summary, record: result.record, extra: new Set() };
 	state.folds.set(result.record.ordinal, holder.fold);
 	persist(pi, result.record);
 	return result;
@@ -684,6 +724,9 @@ function settle(pi: ExtensionAPI, aborted: boolean, outcome: string | undefined)
 function restore(pi: ExtensionAPI, branch: readonly unknown[] | undefined): void {
 	const children = state.chat?.children as FoldableComponent[] | undefined;
 	if (!Array.isArray(children) || !Array.isArray(branch)) return;
+	// a second pass over a transcript that already carries our rows would splice a second row per turn
+	const folded = [...state.folds.values()];
+	if (folded.length > 0 && folded.every((fold) => children.includes(fold.summary))) return;
 	const records = new Map<number, FoldRecord>();
 	let foldsEnabled = true;
 	for (const item of branch) {
@@ -722,8 +765,46 @@ function restore(pi: ExtensionAPI, branch: readonly unknown[] | undefined): void
 	rerender();
 }
 
-function runCommand(pi: ExtensionAPI, args: string): void {
+interface FoldCommandContext {
+	ui?: { notify?(message: string, type?: "info" | "warning" | "error"): void };
+}
+
+/**
+ * `/fold doctor`: which module instance owns each hook and what the shared state sees. A /reload leaves
+ * the previous copy's wrappers behind, and this is the one place that tells them apart.
+ */
+function doctor(ctx: FoldCommandContext | undefined): void {
+	// SAFETY: the class is a real constructor; only its hook markers are read.
+	const proto = ((InteractiveMode as unknown as { prototype?: Record<string, unknown> })?.prototype ?? {}) as Record<string, unknown>;
+	const chat = state.chat as (Record<string, unknown> & { children?: unknown[] }) | undefined;
+	const owners = ["addMessageToChat", "renderSessionItems", "addChild"].map((name) => {
+		const holder = name === "addChild" ? (chat ?? {}) : proto;
+		const method = holder[name] as Hooked<unknown> | undefined;
+		const who = typeof method !== "function" ? "missing" : method[HOOK_OWNER] === owner ? "mine" : method[HOOK_OWNER] === undefined ? "foreign" : "stale";
+		return `${name} ${who}`;
+	});
+	const live = state.live;
+	const report = [
+		`hooks: ${owners.join(", ")}`,
+		`chat: ${chat ? `${chat.children?.length ?? 0} children` : "not attached"} · folds: ${state.folds.size} · folding: ${state.foldsEnabled ? "on" : "off"}`,
+		`live: ${live ? `${live.closed ? "settled" : "running"} · ${live.calls.size} calls · ${live.hidden.size} hidden · ${live.inserted ? "row in" : "no row"}` : "none"}`,
+	].join("\n");
+	debug("doctor", () => ({ report }));
+	if (!state.chat) {
+		ctx?.ui?.notify?.(report, "info");
+		return;
+	}
+	// a chat row stays on screen and can be copied, unlike a status line that fades
+	state.chat.addChild(new Text(`${report}\n`, 1, 0));
+	rerender();
+}
+
+function runCommand(pi: ExtensionAPI, args: string, ctx?: FoldCommandContext): void {
 	const words = args.trim().split(/\s+/).filter(Boolean);
+	if (words[0] === "doctor") {
+		doctor(ctx);
+		return;
+	}
 	const target = words[0] === "turn" ? words[1] : words[0];
 	if (target === "on" || target === "off") {
 		state.foldsEnabled = target === "on";
@@ -743,10 +824,10 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 	installRenderHook(pi);
 
 	pi.registerCommand("fold", {
-		description: "Fold turn transcripts: /fold turn [N|last], /fold on|off",
-		handler: async (args) => {
+		description: "Fold turn transcripts: /fold turn [N|last], /fold on|off, /fold doctor",
+		handler: async (args, ctx) => {
 			try {
-				runCommand(pi, args);
+				runCommand(pi, args, ctx);
 			} catch (error) {
 				warn("command failed", error);
 			}
@@ -759,7 +840,15 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 		installChatHook();
 	};
 
-	pi.on("session_start", (_event, ctx) => reload(ctx));
+	pi.on("session_start", (_event, ctx) => {
+		reload(ctx);
+		// /reload rebuilds the transcript before the extension comes back; fold it from the branch again
+		try {
+			restore(pi, ctx.sessionManager?.getBranch?.());
+		} catch (error) {
+			warn("restore after start failed", error);
+		}
+	});
 
 	pi.on("session_tree", (_event, ctx) => reload(ctx));
 
@@ -810,5 +899,18 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 }
 
 /** Test seam: the turn state machine, drivable with a fake pi, a fake container and fake components. */
-export const __test = { state, classes, attachChat, beginLive, settle, finishLive, releaseLive, revive, detachLive, liveForCurrentTurn };
+export const __test = {
+	state,
+	classes,
+	attachChat,
+	installChatHook,
+	installRenderHook,
+	beginLive,
+	settle,
+	finishLive,
+	releaseLive,
+	revive,
+	detachLive,
+	liveForCurrentTurn,
+};
 
