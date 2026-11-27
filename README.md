@@ -89,6 +89,6 @@ Known edges:
 ## Dev
 
 ```bash
-npm test        # node --test, 18 checks
+npm test        # node --test, 24 checks
 npm run typecheck
 ```

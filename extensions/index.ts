@@ -7,11 +7,12 @@ import {
 	applyHidden,
 	foldInterval,
 	hideComponent,
-	isFinalReply,
 	isThinkingBlock,
+	isToolRow,
 	lastUserIndex,
 	nestedFailures,
 	nestedTools,
+	pickAnswerRun,
 	railComponent,
 	showComponent,
 	SummaryLine,
@@ -53,7 +54,7 @@ interface Live {
 	record: FoldRecord;
 	inserted: boolean;
 	expanded: boolean;
-	reply?: FoldableComponent;
+	replies: FoldableComponent[];
 	timer?: ReturnType<typeof setInterval>;
 }
 
@@ -349,6 +350,7 @@ function beginLive(pi: ExtensionAPI): void {
 		record,
 		inserted: false,
 		expanded: false,
+		replies: [],
 	// SAFETY: the row needs the live record it belongs to; it is attached one statement below, before any render.
 	summary: undefined as unknown as SummaryLine,
 	};
@@ -370,9 +372,9 @@ function beginLive(pi: ExtensionAPI): void {
 			live.record.expanded = expanded;
 			applyHidden(live.hidden, expanded);
 			// the answer stays out of the rail either way
-			if (live.reply) {
-				showComponent(live.reply);
-				unrailComponent(live.reply);
+			for (const reply of live.replies) {
+				showComponent(reply);
+				unrailComponent(reply);
 			}
 			persist(pi, live.record);
 			rerender();
@@ -406,7 +408,7 @@ function resolveLive(live: Live): FoldableComponent[] | undefined {
 
 /** Process, not answer: tool rows, cc's tool groups, and every message the run streams before it settles. */
 function isProcess(component: FoldableComponent, live: Live): boolean {
-	if (component === live.reply) return false;
+	if (live.replies.includes(component)) return false;
 	if (component instanceof ToolExecutionComponent) return true;
 	if (typeof (component as { toolName?: unknown }).toolName === "string") return true;
 	// thinking and tool-calling text arrive in the same component the answer does: hidden until settle
@@ -440,9 +442,9 @@ function releaseLive(live: Live | undefined): void {
 	if (!live) return;
 	if (live.timer) clearInterval(live.timer);
 	applyHidden(live.hidden, true);
-	if (live.reply) {
-		showComponent(live.reply);
-		unrailComponent(live.reply);
+	for (const reply of live.replies) {
+		showComponent(reply);
+		unrailComponent(reply);
 	}
 	const children = state.chat?.children as FoldableComponent[] | undefined;
 	if (Array.isArray(children) && live.inserted) {
@@ -462,25 +464,39 @@ function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): 
 	live.summary.update({ ms, outcome });
 	if (state.live === live) state.live = undefined;
 	const children = resolveLive(live);
-	const reply = children && [...children.slice(live.userIndex + 1)].reverse().find((component) => isFinalReply(component, AssistantMessageComponent));
-	if (reply) {
-		live.reply = reply;
-		live.hidden.delete(reply);
-		hideThinking(reply);
-	}
+	// the run stops at the next user message, like sweep
+	const end = children?.findIndex((component, index) => index > live.userIndex && component instanceof UserMessageComponent) ?? -1;
+	const segment = children?.slice(live.userIndex + 1, end < 0 ? children.length : end) ?? [];
+	// the whole answer run after the last tool row, not only its last message: a continuation
+	// (a gate's nudge, a queued reply) streams several text-only messages in one turn
+	live.replies = pickAnswerRun(segment, {
+		AssistantClass: AssistantMessageComponent,
+		isProcess: (component) => isToolRow(component, ToolExecutionComponent),
+	});
 	if (live.record.tools.length === 0) {
+		for (const reply of live.replies) hideThinking(reply);
 		releaseLive(live);
 		rerender();
 		return;
 	}
 	sweep(live);
-	if (reply) {
+	for (const reply of live.replies) live.hidden.delete(reply);
+	applyHidden(live.hidden, live.expanded);
+	// released after applyHidden, so nothing folds them back
+	for (const reply of live.replies) {
 		showComponent(reply);
 		unrailComponent(reply);
+		hideThinking(reply);
 	}
-	applyHidden(live.hidden, live.expanded);
+	const answerRows = segment.filter((component) => component instanceof AssistantMessageComponent).reduce((rows, component) => rows + rowsOf(component), 0);
+	debug("settle", () => ({ userIndex: live.userIndex, end, replies: live.replies.length, answerRows, hidden: live.hidden.size }));
 	persist(pi, live.record);
 	rerender();
+	if (answerRows === 0) {
+		// never eat the answer: with nothing of it visible, the whole turn comes back
+		debug("answer-lost", () => ({ userIndex: live.userIndex, unfolded: live.hidden.size }));
+		live.summary.setExpanded(true);
+	}
 }
 
 /** Fold one turn and remember it, so `/fold turn N` and a reopened session can find it. */

@@ -121,6 +121,38 @@ export function isFinalReply(component: FoldableComponent | undefined, Assistant
 	return hasText && !hasToolCall;
 }
 
+/** A tool row or cc's tool group: the process that ends an answer run. */
+export function isToolRow(component: FoldableComponent | undefined, ToolClass: new (...args: never[]) => unknown): boolean {
+	if (!component) return false;
+	return component instanceof ToolClass || typeof component.toolName === "string";
+}
+
+export interface AnswerRunInput {
+	AssistantClass: new (...args: never[]) => unknown;
+	/** What ends the run when met on the way back: a tool row or group. */
+	isProcess: (component: FoldableComponent) => boolean;
+}
+
+/**
+ * The answer run at the end of one user turn (`segment`: everything after its user message): the
+ * assistant messages with text and no tool call, counted back from the end until the first process
+ * component — not only the last one, a continuation run leaves several. A message that still carries
+ * a tool call (the run was cut off) is stepped over, so the text before it stays the answer.
+ */
+export function pickAnswerRun(segment: readonly (FoldableComponent | undefined)[], { AssistantClass, isProcess }: AnswerRunInput): FoldableComponent[] {
+	const run: FoldableComponent[] = [];
+	for (let index = segment.length - 1; index >= 0; index -= 1) {
+		const component = segment[index];
+		if (!component || component instanceof Spacer) continue;
+		if (component instanceof AssistantClass) {
+			if (isFinalReply(component, AssistantClass)) run.unshift(component);
+			continue;
+		}
+		if (isProcess(component)) break;
+	}
+	return run;
+}
+
 /** `42s`, `1m02s`; a missing start time reads as `0s`. */
 export function formatDuration(ms: number | undefined): string {
 	const seconds = Math.max(0, Math.round((ms ?? 0) / 1000));
@@ -315,7 +347,7 @@ export function foldInterval({ children, userIndex, ToolClass, AssistantClass, U
 				nested: nestedTools(tool.result),
 				nestedFailed: nestedFailures(tool.result) || undefined,
 			}));
-	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass });
+	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass, ToolClass });
 }
 
 interface FoldWithInput {
@@ -330,12 +362,14 @@ interface FoldWithInput {
 	onToggle?: (expanded: boolean) => void;
 	AssistantClass: new (...args: never[]) => unknown;
 	UserClass: new (...args: never[]) => unknown;
+	ToolClass: new (...args: never[]) => unknown;
 }
 
-function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass }: FoldWithInput): FoldResult | undefined {
+function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass, ToolClass }: FoldWithInput): FoldResult | undefined {
 	if (tools.length === 0) return undefined;
-	const reply = [...interval].reverse().find((component) => isFinalReply(component, AssistantClass));
-	const hidden = interval.filter((component) => component !== reply);
+	// the whole answer run after the last tool row, not only its last message
+	const replies = pickAnswerRun(interval, { AssistantClass, isProcess: (component) => isToolRow(component, ToolClass) });
+	const hidden = interval.filter((component) => !replies.includes(component));
 	const ordinal = children.slice(0, userIndex + 1).filter((component) => component instanceof UserClass).length - 1;
 	const record: FoldRecord = { ordinal, ms, outcome, tools: [...tools], expanded };
 	const summary = new SummaryLine({ ...record, fg }, (next) => {

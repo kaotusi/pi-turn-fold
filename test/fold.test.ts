@@ -342,3 +342,58 @@ test("a thinking block is told apart from the answer and from other rows", () =>
 	assert.equal(isThinkingBlock({ setExpanded: () => {}, messageTimestamp: 1 } as unknown as FoldableComponent), false);
 	assert.equal(isThinkingBlock(undefined), false);
 });
+
+const said = (text: string) => new Assistant([{ type: "text", text }]);
+const calls = (text: string) => new Assistant([{ type: "text", text }, { type: "toolCall" }]);
+const shown = (component: FoldableComponent) => component.render(80).length > 0;
+
+test("the answer run is the single reply after the tools", () => {
+	const tool = new Tool("read");
+	const answer = said("done");
+	const result = fold([new User(), calls("looking"), tool, answer]);
+	assert.ok(result);
+	assert.equal(shown(tool), false);
+	assert.equal(shown(answer), true);
+});
+
+test("the answer run is every text-only message after the last tool row, not only the last one", () => {
+	const tool = new Tool("bash");
+	const first = said("first part");
+	const second = said("second part");
+	const result = fold([new User(), tool, first, second]);
+	assert.ok(result);
+	assert.equal(shown(tool), false);
+	assert.equal(shown(first), true, "the first part of a multi-segment answer stays visible");
+	assert.equal(shown(second), true);
+});
+
+test("text, tool, text: only the text after the tool is the answer", () => {
+	const before = calls("running it now");
+	const tool = new Tool("bash");
+	const after = said("all done");
+	const result = fold([new User(), before, tool, after]);
+	assert.ok(result);
+	assert.equal(shown(before), false);
+	assert.equal(shown(tool), false);
+	assert.equal(shown(after), true);
+});
+
+test("a last message still carrying a tool call steps aside for the text before it", () => {
+	const tool = new Tool("read");
+	const earlier = said("the answer so far");
+	const cutOff = calls("one more thing");
+	const result = fold([new User(), tool, earlier, cutOff]);
+	assert.ok(result);
+	assert.equal(shown(earlier), true);
+	assert.equal(shown(cutOff), false);
+});
+
+test("a notice after the answer does not end the answer run", () => {
+	const tool = new Tool("read");
+	const answer = said("done");
+	const notice: FoldableComponent = { render: () => ["notice"], invalidate() {} };
+	const result = fold([new User(), tool, answer, notice]);
+	assert.ok(result);
+	assert.equal(shown(answer), true);
+	assert.equal(shown(notice), false);
+});
