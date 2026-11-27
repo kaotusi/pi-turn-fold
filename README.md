@@ -63,7 +63,9 @@ on:
    message hook) and marks the row dirty — nothing invalidates inside a frame,
 4. on `agent_settled` the row locks to `took …`, every text of the turn is shown
    except short narration before a tool call, and the whole thing is appended to the
-   session.
+   session. A settle that arrives while the agent is still running (`ctx.isIdle()` is
+   false) is ignored; if the turn does go on after settling, the same row revives
+   instead of a second one growing, and its clock restarts with that segment.
 
 The summary row is a real child of the chat container, which is what makes clicks
 work: pi dispatches mouse events over the component tree, not over rendered text.

@@ -54,12 +54,15 @@ interface Live {
 	inserted: boolean;
 	expanded: boolean;
 	replies: FoldableComponent[];
+	/** Settled: the row still stands, and the turn revives it if it goes on. */
+	closed: boolean;
 	timer?: ReturnType<typeof setInterval>;
 }
 
 interface FoldState {
 	chat?: Container;
 	ui?: Ui;
+	pi?: ExtensionAPI;
 	runStart?: number;
 	outcome?: string;
 	foldsEnabled: boolean;
@@ -68,6 +71,18 @@ interface FoldState {
 }
 
 const state: FoldState = { foldsEnabled: true, folds: new Map() };
+
+/**
+ * The component classes every turn decision tests against. pi exports them; the tests swap in fakes,
+ * so both sides read one table instead of naming a class in a dozen places.
+ */
+// SAFETY: each value is the real component class; the cast only widens the constructor signature so the
+// table can also hold the fakes tests assign, which share the render/invalidate surface the hook uses.
+const classes = {
+	User: UserMessageComponent as unknown as new (...args: never[]) => unknown,
+	Assistant: AssistantMessageComponent as unknown as new (...args: never[]) => unknown,
+	Tool: ToolExecutionComponent as unknown as new (...args: never[]) => unknown,
+};
 
 const DEBUG_LOG = process.env.PI_TURN_FOLD_DEBUG;
 
@@ -159,11 +174,26 @@ function attachSummary(live: Live): void {
 	if (!Array.isArray(children)) return;
 	if (live.userIndex < 0) {
 		const last = children[children.length - 1];
-		if (!(last instanceof UserMessageComponent)) return;
+		if (!(last instanceof classes.User)) return;
 		live.userIndex = children.length - 1;
-		live.ordinal = children.filter((component) => component instanceof UserMessageComponent).length - 1;
+		live.ordinal = children.filter((component) => component instanceof classes.User).length - 1;
 		live.record.ordinal = live.ordinal;
 	}
+	if (insertSummary(live, children)) rerender();
+}
+
+/** A user message arriving while a row is live: the first one places the row, a later one starts the next turn. */
+function placeUserMessage(live: Live, component: FoldableComponent, children: FoldableComponent[], append: () => void): void {
+	const first = live.userIndex < 0;
+	// a newer user message opens the next turn: this row stays a fold
+	if (!first) detachLive(live);
+	append();
+	if (!first) return;
+	const index = children.indexOf(component);
+	if (index < 0) return;
+	live.userIndex = index;
+	live.ordinal = children.slice(0, index + 1).filter((item) => item instanceof classes.User).length - 1;
+	live.record.ordinal = live.ordinal;
 	if (insertSummary(live, children)) rerender();
 }
 
@@ -181,22 +211,15 @@ function attachChat(chat: Container): void {
 			const component = child as FoldableComponent | undefined;
 			const live = state.live;
 			if (live && component) {
-				if (component instanceof UserMessageComponent && live.userIndex < 0) {
-					addChild.call(this, child);
-					const children = this.children as FoldableComponent[];
-					const index = children.indexOf(component);
-					if (index >= 0) {
-						live.userIndex = index;
-						live.ordinal = children.slice(0, index + 1).filter((item) => item instanceof UserMessageComponent).length - 1;
-						live.record.ordinal = live.ordinal;
-						if (insertSummary(live, children)) rerender();
-					}
+				if (component instanceof classes.User) {
+					placeUserMessage(live, component, this.children as FoldableComponent[], () => addChild.call(this, child));
 					return;
 				}
-				if (isProcess(component, live)) {
-					if (live.expanded) railComponent(component);
+				const current = rowFor(component);
+				if (current && isProcess(component, current)) {
+					if (current.expanded) railComponent(component);
 					else hideComponent(component);
-					live.hidden.add(component);
+					current.hidden.add(component);
 					debug("add-child-hidden", () => ({ name: nameOf(component), rows: rowsOf(component) }));
 				}
 			}
@@ -209,7 +232,7 @@ function attachChat(chat: Container): void {
 	if (typeof render === "function" && !render[HOOK_PAINT]) {
 		const wrapped: PaintHook = function (this: Container, width) {
 			// last line of defence: a component that slipped past addChild is folded before it is painted
-			if (state.live) {
+			if (state.live && !state.live.closed) {
 				try {
 					sweep(state.live);
 				} catch (error) {
@@ -268,9 +291,10 @@ function installChatHook(): boolean {
 			after: children?.length,
 			added: before === undefined || !children ? undefined : nameOf(children[children.length - 1] as FoldableComponent),
 		}));
-		if (state.live) {
+		const live = state.live;
+		if (live && !live.closed) {
 			try {
-				sweep(state.live);
+				sweep(live);
 			} catch (error) {
 				warn("could not hide the running turn", error);
 			}
@@ -335,9 +359,22 @@ function rerender(): void {
 	queueMicrotask(paint);
 }
 
+/** One 500ms tick per live row: pi and cc append rows that never pass the message hook. */
+function startTimer(live: Live): void {
+	if (live.timer) return;
+	live.timer = setInterval(() => {
+		if (state.live !== live || live.closed) return;
+		sweep(live);
+		live.summary.invalidate();
+		rerender();
+	}, 500);
+	live.timer.unref?.();
+}
+
 /** Start the live row: everything the run adds to the chat goes behind it until it settles. */
 function beginLive(pi: ExtensionAPI): void {
-	releaseLive(state.live);
+	// a finished turn stays a fold; only one that never settled is closed here
+	detachLive(state.live);
 	const record: FoldRecord = { ordinal: 0, outcome: "running", tools: [], expanded: false };
 	const live: Live = {
 		ordinal: 0,
@@ -350,6 +387,7 @@ function beginLive(pi: ExtensionAPI): void {
 		inserted: false,
 		expanded: false,
 		replies: [],
+		closed: false,
 	// SAFETY: the row needs the live record it belongs to; it is attached one statement below, before any render.
 	summary: undefined as unknown as SummaryLine,
 	};
@@ -380,15 +418,73 @@ function beginLive(pi: ExtensionAPI): void {
 		},
 	);
 	state.live = live;
-	live.timer = setInterval(() => {
-		if (state.live !== live) return;
-		// rows pi and cc append on their own (streaming text, notices) never pass the message hook
-		sweep(live);
-		live.summary.invalidate();
-		rerender();
-	}, 500);
-	live.timer.unref?.();
+	startTimer(live);
 	attachSummary(live);
+}
+
+/** True when the chat already holds a user message newer than this row's turn: the row is history. */
+function turnAdvanced(live: Live): boolean {
+	const children = state.chat?.children as FoldableComponent[] | undefined;
+	if (!Array.isArray(children) || live.userIndex < 0) return false;
+	return lastUserIndex(children, classes.User) > live.userIndex;
+}
+
+/** The turn went on after settling: same row, its own clock, `working` again. */
+function revive(live: Live): void {
+	if (!live.closed) return;
+	live.closed = false;
+	live.outcome = "running";
+	live.record.outcome = "running";
+	live.startedAt = Date.now();
+	live.summary.update({ outcome: "running" });
+	startTimer(live);
+	debug("revived", () => ({ ordinal: live.ordinal, calls: live.calls.size, hidden: live.hidden.size }));
+	rerender();
+}
+
+/** The row of the turn that is going on right now: a settled one revives, a superseded one steps aside. */
+function liveForCurrentTurn(): Live | undefined {
+	const live = state.live;
+	if (!live) return undefined;
+	if (turnAdvanced(live)) {
+		detachLive(live);
+		return undefined;
+	}
+	if (live.closed) revive(live);
+	return live;
+}
+
+/** A tool row, bare or grouped: the only arrival that means the turn is doing work again after a settle. */
+function isToolComponent(component: FoldableComponent): boolean {
+	return component instanceof classes.Tool || typeof (component as { toolName?: unknown }).toolName === "string";
+}
+
+/**
+ * The row a freshly arrived component belongs to. A settled row revives for work, not for text: what the
+ * run says after it settled is an answer, and answers stay outside the fold.
+ */
+function rowFor(component: FoldableComponent): Live | undefined {
+	const live = state.live;
+	if (!live) return undefined;
+	if (turnAdvanced(live)) {
+		detachLive(live);
+		return undefined;
+	}
+	if (!live.closed) return live;
+	if (!isToolComponent(component)) return undefined;
+	revive(live);
+	return live;
+}
+
+/** Stop tracking a row: what it folded stays folded, a run that never settled is closed first. */
+function detachLive(live: Live | undefined): void {
+	if (!live) return;
+	if (!live.closed && state.pi) finishLive(state.pi, live, Date.now() - live.startedAt, state.outcome ?? "completed");
+	if (live.timer) {
+		clearInterval(live.timer);
+		live.timer = undefined;
+	}
+	if (state.live === live) state.live = undefined;
 }
 
 /** The chat children, with this run's user message located on first use. */
@@ -396,10 +492,10 @@ function resolveLive(live: Live): FoldableComponent[] | undefined {
 	const children = state.chat?.children as FoldableComponent[] | undefined;
 	if (!Array.isArray(children)) return undefined;
 	if (live.userIndex < 0) {
-		const index = lastUserIndex(children, UserMessageComponent);
+		const index = lastUserIndex(children, classes.User);
 		if (index < 0) return undefined;
 		live.userIndex = index;
-		live.ordinal = children.slice(0, index + 1).filter((component) => component instanceof UserMessageComponent).length - 1;
+		live.ordinal = children.slice(0, index + 1).filter((component) => component instanceof classes.User).length - 1;
 		live.record.ordinal = live.ordinal;
 	}
 	return children;
@@ -408,10 +504,10 @@ function resolveLive(live: Live): FoldableComponent[] | undefined {
 /** Process, not answer: tool rows, cc's tool groups, and every message the run streams before it settles. */
 function isProcess(component: FoldableComponent, live: Live): boolean {
 	if (live.replies.includes(component)) return false;
-	if (component instanceof ToolExecutionComponent) return true;
+	if (component instanceof classes.Tool) return true;
 	if (typeof (component as { toolName?: unknown }).toolName === "string") return true;
 	// thinking and tool-calling text arrive in the same component the answer does: hidden until settle
-	if (component instanceof AssistantMessageComponent) return true;
+	if (component instanceof classes.Assistant) return true;
 	// sub-agent notices and other custom rows: part of the run once it is doing tools
 	return live.calls.size > 0;
 }
@@ -423,7 +519,7 @@ function sweep(live: Live): void {
 	for (let index = live.userIndex + 1; index < children.length; index++) {
 		const component = children[index];
 		if (!component || component === live.summary || component instanceof Spacer) continue;
-		if (component instanceof UserMessageComponent) break;
+		if (component instanceof classes.User) break;
 		if (isProcess(component, live)) live.hidden.add(component);
 	}
 	insertSummary(live, children);
@@ -439,7 +535,10 @@ function sweep(live: Live): void {
 /** Undo a live row completely: the process comes back, the row goes away. */
 function releaseLive(live: Live | undefined): void {
 	if (!live) return;
-	if (live.timer) clearInterval(live.timer);
+	if (live.timer) {
+		clearInterval(live.timer);
+		live.timer = undefined;
+	}
 	applyHidden(live.hidden, true);
 	for (const reply of live.replies) {
 		showComponent(reply);
@@ -455,21 +554,25 @@ function releaseLive(live: Live | undefined): void {
 
 /** Settle the live row: `working` becomes `took`, the answer comes out, the record is persisted. */
 function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): void {
-	if (live.timer) clearInterval(live.timer);
+	if (live.timer) {
+		clearInterval(live.timer);
+		live.timer = undefined;
+	}
 	live.outcome = outcome;
 	live.record.ms = ms;
 	live.record.outcome = outcome;
 	live.record.tools = [...live.calls.values()];
 	live.summary.update({ ms, outcome });
-	if (state.live === live) state.live = undefined;
+	// the row stays: pi settles a turn that may go on, and then this row revives instead of a second one
+	live.closed = true;
 	const children = resolveLive(live);
 	// the run stops at the next user message, like sweep
-	const end = children?.findIndex((component, index) => index > live.userIndex && component instanceof UserMessageComponent) ?? -1;
+	const end = children?.findIndex((component, index) => index > live.userIndex && component instanceof classes.User) ?? -1;
 	const segment = children?.slice(live.userIndex + 1, end < 0 ? children.length : end) ?? [];
 	// every substantive text of the turn, not only the run after the last tool row: a continuation
 	// (a gate's nudge, a queued reply) streams several messages in one turn, and a report sent before
 	// a verifying call is an answer as much as the closing message is
-	live.replies = pickVisibleTexts(segment, AssistantMessageComponent);
+	live.replies = pickVisibleTexts(segment, classes.Assistant);
 	if (live.record.tools.length === 0) {
 		for (const reply of live.replies) hideThinking(reply);
 		releaseLive(live);
@@ -485,7 +588,7 @@ function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): 
 		unrailComponent(reply);
 		hideThinking(reply);
 	}
-	const answerRows = segment.filter((component) => component instanceof AssistantMessageComponent).reduce((rows, component) => rows + rowsOf(component), 0);
+	const answerRows = segment.filter((component) => component instanceof classes.Assistant).reduce((rows, component) => rows + rowsOf(component), 0);
 	debug("settle", () => ({ userIndex: live.userIndex, end, replies: live.replies.length, answerRows, hidden: live.hidden.size }));
 	persist(pi, live.record);
 	rerender();
@@ -494,6 +597,35 @@ function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): 
 		debug("answer-lost", () => ({ userIndex: live.userIndex, unfolded: live.hidden.size }));
 		live.summary.setExpanded(true);
 	}
+}
+
+/** Record a top-level tool call on the turn's row, and fold what it already brought in. */
+function noteToolStart(pi: ExtensionAPI, event: { toolCallId: string; toolName: string; parentToolCallId?: string }): void {
+	// nested calls belong to the tool that started them, not to the turn
+	if (event.parentToolCallId) return;
+	let live = liveForCurrentTurn();
+	// the run went on without a row of its own: open one rather than paint the rest of the turn raw
+	if (!live && state.foldsEnabled) {
+		beginLive(pi);
+		live = state.live;
+	}
+	if (!live) return;
+	const row = live;
+	row.calls.set(event.toolCallId, { name: event.toolName, failed: false });
+	row.summary.invalidate();
+	debug("tool-start", () => ({ tool: event.toolName, hidden: row.hidden.size, inserted: row.inserted }));
+	sweep(row);
+}
+
+function noteToolEnd(event: { toolCallId: string; isError?: boolean; result?: unknown }): void {
+	const live = state.live;
+	const entry = live?.calls.get(event.toolCallId);
+	if (!live || !entry) return;
+	entry.failed = event.isError === true;
+	entry.nested = nestedTools(event.result);
+	entry.nestedFailed = nestedFailures(event.result) || undefined;
+	live.summary.invalidate();
+	sweep(live);
 }
 
 /** Fold one turn and remember it, so `/fold turn N` and a reopened session can find it. */
@@ -519,6 +651,7 @@ function foldAndTrack(pi: ExtensionAPI, input: Parameters<typeof foldInterval>[0
 function settle(pi: ExtensionAPI, aborted: boolean, outcome: string | undefined): void {
 	const children = state.chat?.children as FoldableComponent[] | undefined;
 	const live = state.live;
+	if (live?.closed) return;
 	let ms: number | undefined;
 	if (live) ms = Date.now() - live.startedAt;
 	else if (state.runStart !== undefined) ms = Date.now() - state.runStart;
@@ -536,10 +669,10 @@ function settle(pi: ExtensionAPI, aborted: boolean, outcome: string | undefined)
 	}
 	foldAndTrack(pi, {
 		children,
-		userIndex: lastUserIndex(children, UserMessageComponent),
-		ToolClass: ToolExecutionComponent,
-		AssistantClass: AssistantMessageComponent,
-		UserClass: UserMessageComponent,
+		userIndex: lastUserIndex(children, classes.User),
+		ToolClass: classes.Tool,
+		AssistantClass: classes.Assistant,
+		UserClass: classes.User,
 		ms,
 		outcome: finalOutcome,
 		fg: fg(),
@@ -567,15 +700,15 @@ function restore(pi: ExtensionAPI, branch: readonly unknown[] | undefined): void
 	releaseLive(state.live);
 	// newest turn first: splicing a summary earlier never moves a later turn's user message
 	for (const record of [...records.values()].sort((left, right) => right.ordinal - left.ordinal)) {
-		const userIndices = (children as FoldableComponent[]).flatMap((component, index) => (component instanceof UserMessageComponent ? [index] : []));
+		const userIndices = (children as FoldableComponent[]).flatMap((component, index) => (component instanceof classes.User ? [index] : []));
 		const userIndex = userIndices[record.ordinal];
 		if (userIndex === undefined) continue;
 		foldAndTrack(pi, {
 			children,
 			userIndex,
-			ToolClass: ToolExecutionComponent,
-			AssistantClass: AssistantMessageComponent,
-			UserClass: UserMessageComponent,
+			ToolClass: classes.Tool,
+			AssistantClass: classes.Assistant,
+			UserClass: classes.User,
 			ms: record.ms,
 			outcome: record.outcome,
 			tools: record.tools,
@@ -606,6 +739,7 @@ function runCommand(pi: ExtensionAPI, args: string): void {
 
 export default function piTurnFold(pi: ExtensionAPI): void {
 	if (!installChatHook()) return;
+	state.pi = pi;
 	installRenderHook(pi);
 
 	pi.registerCommand("fold", {
@@ -632,35 +766,20 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 	pi.on("agent_start", () => {
 		state.runStart = Date.now();
 		state.outcome = undefined;
-		if (!state.live) beginLive(pi);
+		// a continuation (retry, queued reply) revives the turn's row; a submitted prompt already opened one
+		if (state.foldsEnabled && !liveForCurrentTurn()) beginLive(pi);
 	});
 
 	pi.on("before_agent_start", (_event, ctx) => {
 		rememberUi(ctx.ui as Ui);
-		// agent_start may have opened the row already; a second one would drop what it hid
-		if (state.foldsEnabled && !state.live) beginLive(pi);
+		// pi fires this only for a submitted prompt, and before that prompt reaches the chat: a new turn,
+		// whatever row is still live belongs to the previous one
+		if (state.foldsEnabled) beginLive(pi);
 	});
 
-	pi.on("tool_execution_start", (event) => {
-		const live = state.live;
-		// nested calls belong to the tool that started them, not to the turn
-		if (!live || event.parentToolCallId) return;
-		live.calls.set(event.toolCallId, { name: event.toolName, failed: false });
-		live.summary.invalidate();
-		debug("tool-start", () => ({ tool: event.toolName, hidden: live.hidden.size, inserted: live.inserted }));
-		sweep(live);
-	});
+	pi.on("tool_execution_start", (event) => noteToolStart(pi, event));
 
-	pi.on("tool_execution_end", (event) => {
-		const live = state.live;
-		const entry = live?.calls.get(event.toolCallId);
-		if (!live || !entry) return;
-		entry.failed = event.isError === true;
-		entry.nested = nestedTools(event.result);
-		entry.nestedFailed = nestedFailures(event.result) || undefined;
-		live.summary.invalidate();
-		sweep(live);
-	});
+	pi.on("tool_execution_end", (event) => noteToolEnd(event));
 
 	pi.on("agent_before_settle", (event) => {
 		state.outcome = event.outcome;
@@ -669,9 +788,19 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 	pi.on("agent_settled", (event, ctx) => {
 		rememberUi(ctx.ui as Ui);
 		const outcome = state.outcome;
+		// the row this run settled; a settle that lands after the next turn opened must not touch it
+		const settled = state.live;
 		// let pi attach the last components before rewriting the container
 		setTimeout(() => {
 			try {
+				const idle = ctx.isIdle();
+				debug("settle-check", () => ({ idle }));
+				// pi also settles between retries and continuations: a run that is already going on keeps its row
+				if (!idle) return;
+				if (state.live !== settled) {
+					debug("settle-ignored-turn-moved");
+					return;
+				}
 				settle(pi, event.aborted, outcome);
 			} catch (error) {
 				warn("fold failed", error);
@@ -679,4 +808,7 @@ export default function piTurnFold(pi: ExtensionAPI): void {
 		}, 0);
 	});
 }
+
+/** Test seam: the turn state machine, drivable with a fake pi, a fake container and fake components. */
+export const __test = { state, classes, attachChat, beginLive, settle, finishLive, releaseLive, revive, detachLive, liveForCurrentTurn };
 
