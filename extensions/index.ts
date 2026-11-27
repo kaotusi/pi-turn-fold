@@ -8,11 +8,10 @@ import {
 	foldInterval,
 	hideComponent,
 	isThinkingBlock,
-	isToolRow,
 	lastUserIndex,
 	nestedFailures,
 	nestedTools,
-	pickAnswerRun,
+	pickVisibleTexts,
 	railComponent,
 	showComponent,
 	SummaryLine,
@@ -467,12 +466,10 @@ function finishLive(pi: ExtensionAPI, live: Live, ms: number, outcome: string): 
 	// the run stops at the next user message, like sweep
 	const end = children?.findIndex((component, index) => index > live.userIndex && component instanceof UserMessageComponent) ?? -1;
 	const segment = children?.slice(live.userIndex + 1, end < 0 ? children.length : end) ?? [];
-	// the whole answer run after the last tool row, not only its last message: a continuation
-	// (a gate's nudge, a queued reply) streams several text-only messages in one turn
-	live.replies = pickAnswerRun(segment, {
-		AssistantClass: AssistantMessageComponent,
-		isProcess: (component) => isToolRow(component, ToolExecutionComponent),
-	});
+	// every substantive text of the turn, not only the run after the last tool row: a continuation
+	// (a gate's nudge, a queued reply) streams several messages in one turn, and a report sent before
+	// a verifying call is an answer as much as the closing message is
+	live.replies = pickVisibleTexts(segment, AssistantMessageComponent);
 	if (live.record.tools.length === 0) {
 		for (const reply of live.replies) hideThinking(reply);
 		releaseLive(live);

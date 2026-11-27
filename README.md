@@ -13,8 +13,9 @@ Fold one pi agent turn into a single clickable row — while it runs, not afterw
 ```
 
 The row is live: process rows are hidden as they arrive, the clock and call counts
-move, and when the turn settles the row locks to `took …` and the final reply is
-released underneath it.
+move, and when the turn settles the row locks to `took …` and the turn's text is
+released underneath it — a report sent before a tool call as much as the closing
+reply. Only short narration that announced a call stays folded.
 
 Click the row to show what it replaced (the tool rows, groups and intermediate
 messages drawn by [pi-cc-extensions](https://github.com/minuque/pi-cc-extensions)),
@@ -60,8 +61,9 @@ on:
 2. the summary row is spliced in above them, under the user message,
 3. a 500 ms tick re-sweeps the container (streaming text and cc rows bypass the
    message hook) and marks the row dirty — nothing invalidates inside a frame,
-4. on `agent_settled` the row locks to `took …`, the final reply is shown, and the
-   whole thing is appended to the session.
+4. on `agent_settled` the row locks to `took …`, every text of the turn is shown
+   except short narration before a tool call, and the whole thing is appended to the
+   session.
 
 The summary row is a real child of the chat container, which is what makes clicks
 work: pi dispatches mouse events over the component tree, not over rendered text.
@@ -81,6 +83,9 @@ Known edges:
 - The live row advances on a 500 ms tick, so a count can lag a fast tool by half a
   second; the clock is cached per second.
 - A turn with no tool calls is not folded — it has nothing to hide.
+- Narration is recognised by shape only: under 120 characters, no markdown, ending
+  on a colon or opening with an announcement word. A short line between calls that
+  matches none of that stays on screen.
 - A reopened turn always comes back collapsed; an expanded restore paints a stale
   first frame, so the expanded state is not restored.
 - Click coordinates must be read off the screen right before clicking: expanding a
@@ -89,6 +94,6 @@ Known edges:
 ## Dev
 
 ```bash
-npm test        # node --test, 24 checks
+npm test        # node --test, 28 checks
 npm run typecheck
 ```

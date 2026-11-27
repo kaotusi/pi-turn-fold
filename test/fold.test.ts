@@ -6,11 +6,11 @@ import {
 	foldInterval,
 	foldTurn,
 	formatDuration,
-	isFinalReply,
-	hasToolCall,
+	isPreamble,
 	lastUserIndex,
 	nestedFailures,
 	nestedTools,
+	pickVisibleTexts,
 	SummaryLine,
 	isThinkingBlock,
 	toolCounts,
@@ -301,17 +301,31 @@ test("a live row rebuilds when a second or a call moves, and settles in place", 
 	assert.deepEqual(row.render(80), [" ▸ took 5s · 2 calls · read×1 · bash×1"]);
 });
 
-test("an assistant message with a pending tool call is process, not the answer", () => {
-	assert.equal(hasToolCall(new Assistant([{ type: "toolCall" }])), true);
-	assert.equal(hasToolCall(new Assistant([{ type: "text", text: "done" }])), false);
-	assert.equal(isFinalReply(new Assistant([{ type: "text", text: "done" }]), Assistant), true);
+test("only a short announcement of the next step is a preamble", () => {
+	assert.equal(isPreamble("让我看一下："), true);
+	assert.equal(isPreamble("我改好了，改了 README 第 12 行那句"), false);
+	assert.equal(isPreamble("| 命令 | exit |"), false);
+	assert.equal(isPreamble("## 总结"), false);
+	assert.equal(isPreamble("结".repeat(200)), false);
 });
 
-test("final reply detection", () => {
-	assert.equal(isFinalReply(new Assistant([{ type: "text", text: "hi" }]), Assistant), true);
-	assert.equal(isFinalReply(new Assistant([{ type: "text", text: "hi" }, { type: "toolCall" }]), Assistant), false);
-	assert.equal(isFinalReply(new Assistant([{ type: "text", text: "  " }]), Assistant), false);
-	assert.equal(isFinalReply(new User(), Assistant), false);
+test("a preamble ends on a colon or trails off, or opens with a step announcement", () => {
+	assert.equal(isPreamble("Running it now:"), true);
+	assert.equal(isPreamble("Running it now..."), true);
+	assert.equal(isPreamble("先跑一次测试…"), true);
+	assert.equal(isPreamble("Let me read the file."), true);
+	assert.equal(isPreamble("Next, the tests."), true);
+	assert.equal(isPreamble("好，开始"), true);
+	assert.equal(isPreamble(`${"x".repeat(118)}：`), true, "119 characters still count as short");
+	assert.equal(isPreamble(`${"x".repeat(119)}：`), false, "120 do not");
+});
+
+test("markdown structure is never a preamble, however short", () => {
+	assert.equal(isPreamble("看一下：\n- a\n- b"), false);
+	assert.equal(isPreamble("1. 先读"), false);
+	assert.equal(isPreamble("```\ncode\n```"), false);
+	assert.equal(isPreamble(""), false);
+	assert.equal(isPreamble("  \n "), false);
 });
 
 test("summary line formatting", () => {
@@ -367,8 +381,8 @@ test("the answer run is every text-only message after the last tool row, not onl
 	assert.equal(shown(second), true);
 });
 
-test("text, tool, text: only the text after the tool is the answer", () => {
-	const before = calls("running it now");
+test("text, tool, text: the narration before the tool folds, the answer after it stays", () => {
+	const before = calls("Running it now:");
 	const tool = new Tool("bash");
 	const after = said("all done");
 	const result = fold([new User(), before, tool, after]);
@@ -378,14 +392,53 @@ test("text, tool, text: only the text after the tool is the answer", () => {
 	assert.equal(shown(after), true);
 });
 
-test("a last message still carrying a tool call steps aside for the text before it", () => {
+test("a report before a verifying call stays on screen with the wrap-up after it", () => {
+	// the shape that lost a 156-line review: the report, a gate's notice, one more call, a short wrap-up
+	const report = said("审查闭环已收敛，逐项复核如下。".repeat(12));
+	const notice: FoldableComponent = { render: () => ["notice"], invalidate() {} };
+	const tool = new Tool("codemode");
+	const wrapUp = said("验证已补跑，没有做的验证：Windows 真机。");
+	const result = fold([new User(), new Tool("edit"), report, notice, tool, wrapUp]);
+	assert.ok(result);
+	assert.equal(shown(report), true, "the report is an answer, not process");
+	assert.equal(shown(notice), false);
+	assert.equal(shown(tool), false);
+	assert.equal(shown(wrapUp), true);
+});
+
+test("a turn of pure narration keeps only its closing line", () => {
+	const first = calls("先看 a：");
+	const second = calls("再看 b：");
+	const done = said("好了");
+	const result = fold([new User(), first, new Tool("read"), second, new Tool("bash"), done]);
+	assert.ok(result);
+	assert.equal(shown(first), false);
+	assert.equal(shown(second), false);
+	assert.equal(shown(done), true);
+
+	result.summary.handleMouse?.({ type: "click", button: "left" });
+	assert.equal(shown(first), true, "expanding brings the narration back");
+	assert.equal(shown(second), true);
+	result.summary.handleMouse?.({ type: "click", button: "left" });
+	assert.equal(shown(first), false);
+	assert.equal(shown(done), true);
+});
+
+test("a cut-off run keeps every substantive text before the tool that swallowed it", () => {
 	const tool = new Tool("read");
 	const earlier = said("the answer so far");
-	const cutOff = calls("one more thing");
+	const cutOff = calls("Let me check one more thing:");
 	const result = fold([new User(), tool, earlier, cutOff]);
 	assert.ok(result);
 	assert.equal(shown(earlier), true);
 	assert.equal(shown(cutOff), false);
+});
+
+test("visible texts are judged by nature, not by what surrounds them", () => {
+	const blank = new Assistant([{ type: "text", text: "  " }]);
+	const bare = new Assistant([{ type: "toolCall" }]);
+	const short = said("我改好了，改了 README 第 12 行那句");
+	assert.deepEqual(pickVisibleTexts([undefined, new User(), blank, bare, short], Assistant), [short]);
 });
 
 test("a notice after the answer does not end the answer run", () => {

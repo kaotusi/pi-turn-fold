@@ -95,12 +95,6 @@ export function toolsOf(component: FoldableComponent | undefined, ToolClass: new
 	return (children as FoldableComponent[]).filter((child) => child instanceof ToolClass);
 }
 
-/** An assistant message that still carries a pending tool call — process, not the answer. */
-export function hasToolCall(component: FoldableComponent | undefined): boolean {
-	const message = component?.lastMessage as { content?: Array<{ type?: string }> } | undefined;
-	return Array.isArray(message?.content) && message.content.some((block) => block?.type === "toolCall");
-}
-
 /** cc's compact thinking box: the only child that carries a collapsed preview of thinking text. */
 export function isThinkingBlock(component: FoldableComponent | undefined): boolean {
 	const block = component as { setExpanded?: unknown; messageTimestamp?: unknown; runStartIndex?: unknown } | undefined;
@@ -111,46 +105,39 @@ export function isThinkingBlock(component: FoldableComponent | undefined): boole
 	);
 }
 
-/** The turn's answer: an assistant message with visible text and no pending tool call. */
-export function isFinalReply(component: FoldableComponent | undefined, AssistantClass: new (...args: never[]) => unknown): boolean {
-	if (!component || !(component instanceof AssistantClass)) return false;
-	const message = component.lastMessage as { content?: Array<{ type: string; text?: string }> } | undefined;
+/** Narration this short is an announcement of the next step, not a report: the one kind of text that folds. */
+const MAX_PREAMBLE_CHARS = 120;
+
+/** Short, plain text that announces the next step: folded with the call it leads to, unlike every other answer. */
+export function isPreamble(text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.length >= MAX_PREAMBLE_CHARS) return false;
+	if (/#|\||```|^\s*[-*+]\s|^\s*\d+\.\s/m.test(trimmed)) return false;
+	return /(?:[:：…]|\.\.\.)$/.test(trimmed) || /^(让我|我来|我先|先看|先读|先|接下来|现在|然后|再|好[，,]|Next|Let me|I'?ll|Now)/i.test(trimmed);
+}
+
+/** The text blocks of an assistant message, joined the way its component lists them. */
+function textOf(component: FoldableComponent): string {
+	const message = component.lastMessage as { content?: Array<{ type?: string; text?: string }> } | undefined;
 	const blocks = Array.isArray(message?.content) ? message.content : [];
-	const hasText = blocks.some((block) => block.type === "text" && (block.text ?? "").trim() !== "");
-	const hasToolCall = blocks.some((block) => block.type === "toolCall");
-	return hasText && !hasToolCall;
-}
-
-/** A tool row or cc's tool group: the process that ends an answer run. */
-export function isToolRow(component: FoldableComponent | undefined, ToolClass: new (...args: never[]) => unknown): boolean {
-	if (!component) return false;
-	return component instanceof ToolClass || typeof component.toolName === "string";
-}
-
-export interface AnswerRunInput {
-	AssistantClass: new (...args: never[]) => unknown;
-	/** What ends the run when met on the way back: a tool row or group. */
-	isProcess: (component: FoldableComponent) => boolean;
+	return blocks
+		.filter((block) => block.type === "text")
+		.map((block) => block.text ?? "")
+		.join("\n\n")
+		.trim();
 }
 
 /**
- * The answer run at the end of one user turn (`segment`: everything after its user message): the
- * assistant messages with text and no tool call, counted back from the end until the first process
- * component — not only the last one, a continuation run leaves several. A message that still carries
- * a tool call (the run was cut off) is stepped over, so the text before it stays the answer.
+ * The texts of one user turn (`segment`: everything after its user message) that stay visible: every
+ * assistant message whose text is not a short preamble to a tool call. A report sent before a call is
+ * an answer as much as the closing message is, so nothing stops at a tool row.
  */
-export function pickAnswerRun(segment: readonly (FoldableComponent | undefined)[], { AssistantClass, isProcess }: AnswerRunInput): FoldableComponent[] {
-	const run: FoldableComponent[] = [];
-	for (let index = segment.length - 1; index >= 0; index -= 1) {
-		const component = segment[index];
-		if (!component || component instanceof Spacer) continue;
-		if (component instanceof AssistantClass) {
-			if (isFinalReply(component, AssistantClass)) run.unshift(component);
-			continue;
-		}
-		if (isProcess(component)) break;
-	}
-	return run;
+export function pickVisibleTexts(segment: readonly (FoldableComponent | undefined)[], AssistantClass: new (...args: never[]) => unknown): FoldableComponent[] {
+	return segment.filter((component): component is FoldableComponent => {
+		if (!component || !(component instanceof AssistantClass)) return false;
+		const text = textOf(component);
+		return text !== "" && !isPreamble(text);
+	});
 }
 
 /** `42s`, `1m02s`; a missing start time reads as `0s`. */
@@ -347,7 +334,7 @@ export function foldInterval({ children, userIndex, ToolClass, AssistantClass, U
 				nested: nestedTools(tool.result),
 				nestedFailed: nestedFailures(tool.result) || undefined,
 			}));
-	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass, ToolClass });
+	return foldWith({ children, userIndex, interval, tools: entries, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass });
 }
 
 interface FoldWithInput {
@@ -362,13 +349,12 @@ interface FoldWithInput {
 	onToggle?: (expanded: boolean) => void;
 	AssistantClass: new (...args: never[]) => unknown;
 	UserClass: new (...args: never[]) => unknown;
-	ToolClass: new (...args: never[]) => unknown;
 }
 
-function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass, ToolClass }: FoldWithInput): FoldResult | undefined {
+function foldWith({ children, userIndex, interval, tools, ms, outcome, expanded, fg, onToggle, AssistantClass, UserClass }: FoldWithInput): FoldResult | undefined {
 	if (tools.length === 0) return undefined;
-	// the whole answer run after the last tool row, not only its last message
-	const replies = pickAnswerRun(interval, { AssistantClass, isProcess: (component) => isToolRow(component, ToolClass) });
+	// every substantive text of the turn, not only the last run after the tools
+	const replies = pickVisibleTexts(interval, AssistantClass);
 	const hidden = interval.filter((component) => !replies.includes(component));
 	const ordinal = children.slice(0, userIndex + 1).filter((component) => component instanceof UserClass).length - 1;
 	const record: FoldRecord = { ordinal, ms, outcome, tools: [...tools], expanded };
